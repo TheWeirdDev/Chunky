@@ -1,0 +1,64 @@
+name: Rust
+
+on:
+ push:
+    tags:
+      - "[0-9]+.*"
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  create-release:
+    # If you don't set an input tag, it's a dry run (no uploads).
+    if: "startsWith(github.event.ref, 'refs/tags')"
+    runs-on: ubuntu-20.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/create-gh-release-action@v1
+        with:
+          changelog: CHANGELOG.md
+          token: ${{ secrets.GITHUB_TOKEN }}
+  
+  upload-assets:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: i686-pc-windows-msvc
+            os: windows-latest
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-20.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-20.04
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: chunky
+          tar: none
+          # (optional) On which platform to distribute the `.zip` file.
+          # [default value: windows]
+          # [possible values: all, unix, windows, none]
+          zip: all
+          target: ${{ matrix.target }}
+          archive: app-$target
+          # uncomment this for debug
+          # ref: refs/tags/debug_release
+        env:
+          # (required)
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  changelog:
+    runs-on: ubuntu-20.04
+    steps:
+      - name: "✏️ Generate release changelog"
+        uses: heinrichreimer/action-github-changelog-generator@v2.4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
