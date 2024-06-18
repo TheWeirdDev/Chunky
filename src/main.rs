@@ -8,7 +8,7 @@ use std::sync::Arc;
 use crate::args::Args;
 
 use clap::Parser;
-use dns::CachedResolver;
+use dns::{CachedResolver, DNSServerKind};
 use tokio::io;
 use tokio::net::TcpListener;
 
@@ -20,6 +20,7 @@ async fn main() -> io::Result<()> {
         port,
         chunk_size,
         dot_server,
+        dns_tcp_server,
         // doh_server,
         verbose,
     } = args;
@@ -33,8 +34,14 @@ async fn main() -> io::Result<()> {
     log::info!("Listening on {host}:{port}");
 
     let dot_server = dot_server.unwrap();
-    let resolver = Arc::new(CachedResolver::new(dot_server.as_str()).await?);
-    log::info!("DNS resolver configured. using: {dot_server}");
+    let (dns_server, dns_server_kind) = if dns_tcp_server.is_some() {
+        (dns_tcp_server.unwrap(), DNSServerKind::TCP)
+    } else {
+        (dot_server, DNSServerKind::TLS)
+    };
+
+    let resolver = Arc::new(CachedResolver::new(dns_server.as_str(), dns_server_kind).await?);
+    log::info!("DNS resolver configured. using: {dns_server}");
     log::info!("Chunk size is: {chunk_size}");
 
     loop {
