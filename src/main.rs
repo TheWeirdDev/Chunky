@@ -21,6 +21,7 @@ async fn main() -> io::Result<()> {
         chunk_size,
         dot_server,
         dns_tcp_server,
+        dns_udp_server,
         // doh_server,
         verbose,
     } = args;
@@ -36,6 +37,8 @@ async fn main() -> io::Result<()> {
     let dot_server = dot_server.unwrap();
     let (dns_server, dns_server_kind) = if dns_tcp_server.is_some() {
         (dns_tcp_server.unwrap(), DNSServerKind::TCP)
+    } else if dns_udp_server.is_some() {
+        (dns_udp_server.unwrap(), DNSServerKind::UDP)
     } else {
         (dot_server, DNSServerKind::TLS)
     };
