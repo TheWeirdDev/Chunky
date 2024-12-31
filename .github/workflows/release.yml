@@ -57,7 +57,7 @@ jobs:
           # [possible values: all, unix, windows, none]
           zip: all
           target: ${{ matrix.target }}
-          archive: app-$target
+          archive: chunky-$target
           # uncomment this for debug
           # ref: refs/tags/debug_release
         env:
