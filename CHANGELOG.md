@@ -6,3 +6,6 @@
 
 # 0.1.3
 - Add tcp dns server support
+
+# 0.1.4
+- Add udp dns server support
