@@ -5,16 +5,15 @@ mod http;
 
 use std::sync::Arc;
 
-use crate::args::Args;
-
 use clap::Parser;
-use dns::{CachedResolver, DNSServerKind};
 use tokio::io;
 use tokio::net::TcpListener;
 
+use crate::args::Args;
+use crate::dns::{CachedResolver, DNSServerKind};
+
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    let args = Args::parse();
     let Args {
         host,
         port,
@@ -23,30 +22,27 @@ async fn main() -> io::Result<()> {
         dns_tcp_server,
         dns_udp_server,
         dns_https_server,
-        // doh_server,
+        prefer_ipv6,
         verbose,
-    } = args;
+    } = Args::parse();
 
     let env = env_logger::Env::default()
         .filter_or("CHUNKY_LOG_LEVEL", if verbose { "debug" } else { "info" });
     env_logger::init_from_env(env);
-    log::trace!("test");
 
-    let listener = TcpListener::bind((host.clone(), port)).await?;
+    let listener = TcpListener::bind((host.as_str(), port)).await?;
     log::info!("Listening on {host}:{port}");
 
-    let dot_server = dot_server.unwrap();
-    let (dns_server, dns_server_kind) = if dns_tcp_server.is_some() {
-        (dns_tcp_server.unwrap(), DNSServerKind::TCP)
-    } else if dns_udp_server.is_some() {
-        (dns_udp_server.unwrap(), DNSServerKind::UDP)
-    } else if dns_https_server.is_some() {
-        (dns_https_server.unwrap(), DNSServerKind::HTTPS)
-    } else {
-        (dot_server, DNSServerKind::TLS)
+    let (dns_server, dns_server_kind) = match (dns_tcp_server, dns_udp_server, dns_https_server) {
+        (Some(server), _, _) => (server, DNSServerKind::Tcp),
+        (None, Some(server), _) => (server, DNSServerKind::Udp),
+        (None, None, Some(server)) => (server, DNSServerKind::Https),
+        _ => (dot_server, DNSServerKind::Tls),
     };
 
-    let resolver = Arc::new(CachedResolver::new(dns_server.as_str(), dns_server_kind).await?);
+    let resolver = Arc::new(
+        CachedResolver::new(&dns_server, dns_server_kind, prefer_ipv6).await?,
+    );
     log::info!("DNS resolver configured. using: {dns_server}");
     log::info!("Chunk size is: {chunk_size}");
 
@@ -54,9 +50,8 @@ async fn main() -> io::Result<()> {
         let (client, _) = listener.accept().await?;
         let resolver = resolver.clone();
         tokio::spawn(async move {
-            match handler::proxy(client, &resolver, chunk_size).await {
-                Ok(_) => {}
-                Err(e) => log::error!("Error: {e}"),
+            if let Err(e) = handler::proxy(client, &resolver, chunk_size).await {
+                log::error!("Error: {e}");
             }
         });
     }

@@ -9,7 +9,7 @@ pub struct Args {
     pub port: u16,
 
     #[arg(short = 'T', long, default_value = "1.1.1.1")]
-    pub dot_server: Option<String>,
+    pub dot_server: String,
 
     #[arg(short = 't', long)]
     pub dns_tcp_server: Option<String>,
@@ -20,8 +20,9 @@ pub struct Args {
     #[arg(short = 'H', long)]
     pub dns_https_server: Option<String>,
 
-    // #[arg(short = 'H', long)]
-    // pub doh_server: Option<Vec<String>>,
+    #[arg(short = '6', long)]
+    pub prefer_ipv6: bool,
+
     #[arg(short = 'c', long, default_value = "500")]
     pub chunk_size: usize,
 
