@@ -9,7 +9,7 @@ Chunky has a few configuration options that can be set using command line argume
 - `--host`: The host to listen on. Default: **127.0.0.1**
 - `--port`: The port to listen on. Default: **8000**
 - `-T` or `--dot-server`: The DNS-over-TLS server to use. Default: **1.1.1.1**
-- `c` or `--chunk-size`: The size of each chunk in bytes. Default: **500**
+- `-c` or `--chunk-size`: The size of each chunk in bytes. Default: **500**
 - `-v` or `--verbose`: Enable verbose logging. Default: **Disabled**
 - `-h` or `--help`: Display the help message
 
