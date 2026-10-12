@@ -33,6 +33,35 @@ If the DNS server returns several addresses for a host, or a DNS-over-HTTPS serv
 
 This will start the Chunky proxy on the default host and port mentioned above. You can then **configure your browser or system to use the proxy to access the internet**.
 
+## Building for Android and iOS
+
+`scripts/build-mobile.sh` builds the Android and iOS binaries and packages each one as `dist/chunky-<target>.zip`, the same layout as the release assets.
+
+```bash
+scripts/build-mobile.sh [android|ios|all]   # default: all
+```
+
+Both targets need the Rust targets, which the script adds with `rustup target add`.
+
+**Android** (Linux or macOS host):
+
+1. Install the [Android NDK](https://developer.android.com/ndk/downloads).
+2. Set `ANDROID_NDK` to the NDK directory, for example `export ANDROID_NDK=/path/to/Android-SDK/ndk/30.0.16248370`.
+
+**iOS on macOS**: install Xcode. The script builds with Xcode and ad-hoc signs the binary with `codesign`.
+
+**iOS on Linux**: this needs the [THEOS](https://theos.dev) `darwin-tools` package and the iPhoneOS SDK.
+
+1. Set `THEOS_TOOLS` to its `bin` directory, which provides `ld`, `ar`, and `ranlib`.
+2. Optionally set `LDID` to the `ldid` binary and `ENTITLEMENTS` to an entitlements plist (default: `ent.xml`). The script signs the binary with `ldid -S` when `LDID` is set.
+
+For example: `export THEOS_TOOLS=~/theos/darwin-tools-linux/packages/linux/iphone/bin LDID=$THEOS_TOOLS/ldid`.
+
+Two platform limits apply to both mobile targets:
+
+- `--fake-sni` is only supported on Linux and Android, because it needs raw sockets. Chunking works everywhere.
+- The binaries are command-line programs. Android runs them from a terminal app such as Termux, and iOS needs a jailbroken device.
+
 ## Credits
 
 - [DPYProxy](https://github.com/UPB-SysSec/DPYProxy)
