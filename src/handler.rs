@@ -1,7 +1,11 @@
+use std::future::Future;
+use std::net::IpAddr;
+use std::time::Duration;
+
 use tokio::io::{self, AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
-use tokio::select;
+use tokio::{select, time::timeout};
 
 use crate::dns::CachedResolver;
 use crate::http;
@@ -24,10 +28,10 @@ pub async fn proxy(
     } = http::parse_http_request(&req_line)?;
 
     log::debug!("new connection from {addr:?} to {host}:{port}");
-    let host = resolver.lookup_ip(host).await?;
-    log::debug!("resolved host: {host}");
+    let ips = resolver.lookup_ips(host).await?;
+    log::debug!("resolved host: {ips:?}");
 
-    let upstream = TcpStream::connect((host, port)).await?;
+    let upstream = connect_any(&ips, port).await?;
     let (upstream_reader, mut upstream_writer) = upstream.into_split();
     let upstream_reader = BufReader::new(upstream_reader);
 
@@ -61,6 +65,43 @@ pub async fn proxy(
     }
 
     Ok(())
+}
+
+/// How long a single connection attempt may take before the next address is tried.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Connects to the first address in `ips` that accepts the connection within `CONNECT_TIMEOUT`.
+/// Returns the last connection error if none do.
+async fn connect_any(ips: &[IpAddr], port: u16) -> io::Result<TcpStream> {
+    connect_any_with(ips, CONNECT_TIMEOUT, |ip| TcpStream::connect((ip, port))).await
+}
+
+async fn connect_any_with<F, Fut>(
+    ips: &[IpAddr],
+    limit: Duration,
+    connect: F,
+) -> io::Result<TcpStream>
+where
+    F: Fn(IpAddr) -> Fut,
+    Fut: Future<Output = io::Result<TcpStream>>,
+{
+    let mut last_err = None;
+    for ip in ips {
+        match timeout(limit, connect(*ip)).await {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(e)) => {
+                log::debug!("connect to {ip} failed, trying next: {e}");
+                last_err = Some(e);
+            }
+            Err(_) => {
+                log::debug!("connect to {ip} timed out after {limit:?}, trying next");
+                last_err = Some(io::Error::new(io::ErrorKind::TimedOut, "connect timed out"));
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "No addresses to connect to")
+    }))
 }
 
 /// Reads the request line and the header block, up to the blank line that ends them.
@@ -156,6 +197,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connect_any_falls_back_to_next_address() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Nothing listens on 127.0.0.2, so the first address is refused.
+        let ips = [IpAddr::from([127, 0, 0, 2]), IpAddr::from([127, 0, 0, 1])];
+        let stream = connect_any(&ips, port).await.unwrap();
+        assert_eq!(stream.peer_addr().unwrap().ip(), IpAddr::from([127, 0, 0, 1]));
+    }
+
+    #[tokio::test]
+    async fn connect_any_moves_on_after_timeout() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stalled = IpAddr::from([127, 0, 0, 2]);
+        let ips = [stalled, IpAddr::from([127, 0, 0, 1])];
+        // The first attempt never completes, so only the timeout can move on to the second.
+        let stream = connect_any_with(&ips, Duration::from_millis(50), |ip| async move {
+            if ip == stalled {
+                std::future::pending().await
+            } else {
+                TcpStream::connect((ip, port)).await
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(stream.peer_addr().unwrap().ip(), IpAddr::from([127, 0, 0, 1]));
+    }
+
+    #[tokio::test]
+    async fn connect_any_errors_when_no_address_works() {
+        let ips = [IpAddr::from([127, 0, 0, 2]), IpAddr::from([127, 0, 0, 3])];
+        // Port 1 is almost never open on loopback, so every attempt is refused.
+        assert!(connect_any(&ips, 1).await.is_err());
+        assert!(connect_any(&[], 1).await.is_err());
+    }
+
+    #[tokio::test]
     async fn read_request_head_errors_on_eof_before_request() {
         let mut reader = BufReader::new(&b""[..]);
         let err = read_request_head(&mut reader).await.unwrap_err();
@@ -188,7 +270,7 @@ mod tests {
     /// Runs `proxy` for a CONNECT to a local fake upstream and checks the bytes on the wire.
     #[tokio::test]
     async fn proxy_chunks_client_hello_only() {
-        use crate::dns::{CachedResolver, DNSServerKind};
+        use crate::dns::{CachedResolver, DNSServerKind, IpPreference};
         use tokio::net::{TcpListener, TcpStream};
         use tokio::time::{timeout, Duration};
 
@@ -218,7 +300,7 @@ mod tests {
 
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy_listener.local_addr().unwrap();
-        let resolver = CachedResolver::new("127.0.0.1", DNSServerKind::Tcp, false)
+        let resolver = CachedResolver::new("127.0.0.1", DNSServerKind::Tcp, IpPreference::Any)
             .await
             .unwrap();
         let proxy_task = tokio::spawn(async move {

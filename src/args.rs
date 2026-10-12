@@ -20,8 +20,11 @@ pub struct Args {
     #[arg(short = 'H', long)]
     pub dns_https_server: Option<String>,
 
-    #[arg(short = '6', long)]
+    #[arg(short = '6', long, conflicts_with = "prefer_ipv4")]
     pub prefer_ipv6: bool,
+
+    #[arg(short = '4', long, conflicts_with = "prefer_ipv6")]
+    pub prefer_ipv4: bool,
 
     #[arg(short = 'c', long, default_value = "500")]
     pub chunk_size: usize,

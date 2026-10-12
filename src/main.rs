@@ -10,7 +10,7 @@ use tokio::io;
 use tokio::net::TcpListener;
 
 use crate::args::Args;
-use crate::dns::{CachedResolver, DNSServerKind};
+use crate::dns::{CachedResolver, DNSServerKind, IpPreference};
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -23,8 +23,15 @@ async fn main() -> io::Result<()> {
         dns_udp_server,
         dns_https_server,
         prefer_ipv6,
+        prefer_ipv4,
         verbose,
     } = Args::parse();
+
+    let prefer = match (prefer_ipv6, prefer_ipv4) {
+        (true, _) => IpPreference::Ipv6,
+        (_, true) => IpPreference::Ipv4,
+        _ => IpPreference::Any,
+    };
 
     let env = env_logger::Env::default()
         .filter_or("CHUNKY_LOG_LEVEL", if verbose { "debug" } else { "info" });
@@ -41,7 +48,7 @@ async fn main() -> io::Result<()> {
     };
 
     let resolver = Arc::new(
-        CachedResolver::new(&dns_server, dns_server_kind, prefer_ipv6).await?,
+        CachedResolver::new(&dns_server, dns_server_kind, prefer).await?,
     );
     log::info!("DNS resolver configured. using: {dns_server}");
     log::info!("Chunk size is: {chunk_size}");
