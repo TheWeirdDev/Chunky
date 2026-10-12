@@ -23,6 +23,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
   
   upload-assets:
+    needs: create-release
     strategy:
       matrix:
         include:
