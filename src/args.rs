@@ -26,6 +26,11 @@ pub struct Args {
     #[arg(short = '4', long, conflicts_with = "prefer_ipv6")]
     pub prefer_ipv4: bool,
 
+    /// Spoof the SNI: inject a fake ClientHello with this host name before the real one, and turn
+    /// chunking off. Needs CAP_NET_RAW.
+    #[arg(long, value_name = "HOST")]
+    pub fake_sni: Option<String>,
+
     #[arg(short = 'c', long, default_value = "500")]
     pub chunk_size: usize,
 

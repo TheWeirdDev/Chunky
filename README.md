@@ -14,6 +14,7 @@ Chunky has a few configuration options that can be set using command line argume
 - `-H` or `--dns-https-server`: Use a DNS-over-HTTPS server instead of DNS-over-TLS. Takes a URL, e.g. `https://dns.google/dns-query`.
 - `-6` or `--prefer-ipv6`: Prefer IPv6 addresses when a host has both IPv4 and IPv6. Default: **Disabled**
 - `-4` or `--prefer-ipv4`: Prefer IPv4 addresses when a host has both IPv4 and IPv6. Cannot be used with `-6`. Default: **Disabled**
+- `--fake-sni`: Spoof the SNI: send a fake ClientHello with this host name before the real one, and turn chunking off. Needs `CAP_NET_RAW` (e.g. `sudo setcap cap_net_raw+ep <binary>`). Default: **Disabled**
 - `-c` or `--chunk-size`: The size of each chunk in bytes. Default: **500**
 - `-v` or `--verbose`: Enable verbose logging. Default: **Disabled**
 - `-h` or `--help`: Display the help message

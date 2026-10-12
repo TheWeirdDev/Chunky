@@ -1,6 +1,6 @@
 [package]
 name = "chunky"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 
 [dependencies]
@@ -21,3 +21,6 @@ url = "2.5.4"
 env_logger = "0.11.6"
 log = "0.4.22"
 openssl = { version = "0.10.68", features = ["vendored"] }
+pnet_packet = "0.33"
+libc = "0.2"
+rand = "0.8"

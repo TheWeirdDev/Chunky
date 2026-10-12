@@ -93,21 +93,14 @@ impl CachedResolver {
     }
 }
 
-/// Picks an address from `ips`, preferring the configured family. Falls back to the last one.
-fn pick_ip(ips: &[IpAddr], prefer: IpPreference) -> Option<IpAddr> {
-    let preferred = match prefer {
-        IpPreference::Any => None,
-        IpPreference::Ipv4 => ips.iter().copied().find(IpAddr::is_ipv4),
-        IpPreference::Ipv6 => ips.iter().copied().find(IpAddr::is_ipv6),
-    };
-    preferred.or_else(|| ips.last().copied())
-}
-
-/// Orders `ips` for connecting: the address `pick_ip` chooses comes first, then the rest.
-/// Duplicates are removed.
+/// Orders `ips` for connecting. IPv4 addresses come first, since IPv6 is often unreachable and
+/// costs a timeout. With `IpPreference::Ipv6`, IPv6 comes first. Within each family the DNS order
+/// is kept, and duplicates are removed.
 fn order_ips(ips: &[IpAddr], prefer: IpPreference) -> Vec<IpAddr> {
+    let (v4, v6): (Vec<IpAddr>, Vec<IpAddr>) = ips.iter().copied().partition(IpAddr::is_ipv4);
+    let families = if prefer == IpPreference::Ipv6 { [v6, v4] } else { [v4, v6] };
     let mut ordered = Vec::with_capacity(ips.len());
-    for ip in pick_ip(ips, prefer).into_iter().chain(ips.iter().copied()) {
+    for ip in families.into_iter().flatten() {
         if !ordered.contains(&ip) {
             ordered.push(ip);
         }
@@ -255,56 +248,39 @@ mod tests {
     }
 
     #[test]
-    fn pick_ip_returns_none_for_no_addresses() {
-        assert_eq!(pick_ip(&[], IpPreference::Any), None);
-        assert_eq!(pick_ip(&[], IpPreference::Ipv6), None);
-    }
-
-    #[test]
-    fn pick_ip_prefers_ipv6_when_enabled() {
-        let ips = [v4(1), v6(1), v4(2)];
-        assert_eq!(pick_ip(&ips, IpPreference::Ipv6), Some(v6(1)));
-    }
-
-    #[test]
-    fn pick_ip_prefers_ipv4_when_enabled() {
-        let ips = [v6(1), v4(1), v6(2)];
-        assert_eq!(pick_ip(&ips, IpPreference::Ipv4), Some(v4(1)));
-    }
-
-    #[test]
-    fn pick_ip_falls_back_when_preferred_family_missing() {
-        let v4_only = [v4(1), v4(2)];
-        assert_eq!(pick_ip(&v4_only, IpPreference::Ipv6), Some(v4(2)));
-        let v6_only = [v6(1), v6(2)];
-        assert_eq!(pick_ip(&v6_only, IpPreference::Ipv4), Some(v6(2)));
-    }
-
-    #[test]
-    fn pick_ip_ignores_family_when_not_preferred() {
-        let ips = [v6(1), v4(1)];
-        assert_eq!(pick_ip(&ips, IpPreference::Any), Some(v4(1)));
-    }
-
-    #[test]
-    fn order_ips_puts_chosen_address_first_then_the_rest() {
-        let ips = [v4(1), v6(1), v4(2)];
-        assert_eq!(
-            order_ips(&ips, IpPreference::Ipv6),
-            vec![v6(1), v4(1), v4(2)]
-        );
+    fn order_ips_puts_ipv4_first_by_default() {
+        let ips = [v6(1), v4(1), v6(2), v4(2)];
         assert_eq!(
             order_ips(&ips, IpPreference::Any),
-            vec![v4(2), v4(1), v6(1)]
+            vec![v4(1), v4(2), v6(1), v6(2)]
         );
+        assert_eq!(
+            order_ips(&ips, IpPreference::Ipv4),
+            vec![v4(1), v4(2), v6(1), v6(2)]
+        );
+    }
+
+    #[test]
+    fn order_ips_puts_ipv6_first_when_preferred() {
+        let ips = [v4(1), v6(1), v4(2), v6(2)];
+        assert_eq!(
+            order_ips(&ips, IpPreference::Ipv6),
+            vec![v6(1), v6(2), v4(1), v4(2)]
+        );
+    }
+
+    #[test]
+    fn order_ips_keeps_dns_order_within_a_family() {
+        assert_eq!(order_ips(&[v4(2), v4(1)], IpPreference::Any), vec![v4(2), v4(1)]);
+        assert_eq!(order_ips(&[v6(2), v6(1)], IpPreference::Any), vec![v6(2), v6(1)]);
     }
 
     #[test]
     fn order_ips_removes_duplicates_and_handles_empty() {
         assert!(order_ips(&[], IpPreference::Ipv6).is_empty());
         assert_eq!(
-            order_ips(&[v4(1), v4(1)], IpPreference::Any),
-            vec![v4(1)]
+            order_ips(&[v4(1), v4(1), v6(1), v6(1)], IpPreference::Any),
+            vec![v4(1), v6(1)]
         );
     }
 

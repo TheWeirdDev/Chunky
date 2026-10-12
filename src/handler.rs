@@ -9,11 +9,13 @@ use tokio::{select, time::timeout};
 
 use crate::dns::CachedResolver;
 use crate::http;
+use crate::spoof::Spoofer;
 
 pub async fn proxy(
     stream: TcpStream,
     resolver: &CachedResolver,
     chunk_size: usize,
+    spoofer: Option<&Spoofer>,
 ) -> io::Result<()> {
     let addr = stream.peer_addr()?;
     let (reader, mut writer) = stream.into_split();
@@ -31,7 +33,10 @@ pub async fn proxy(
     let ips = resolver.lookup_ips(host).await?;
     log::debug!("resolved host: {ips:?}");
 
-    let upstream = connect_any(&ips, port).await?;
+    let upstream = match spoofer {
+        Some(spoofer) => connect_any_with(&ips, CONNECT_TIMEOUT, |ip| spoofer.connect(ip, port)).await?,
+        None => connect_any(&ips, port).await?,
+    };
     let (upstream_reader, mut upstream_writer) = upstream.into_split();
     let upstream_reader = BufReader::new(upstream_reader);
 
@@ -45,10 +50,11 @@ pub async fn proxy(
     }
 
     // Only the client's TLS ClientHello is split; the server's replies are forwarded as-is.
+    // With SNI spoofing on, the ClientHello is sent whole.
     let client_to_server = tokio::spawn(forward(
         reader,
         upstream_writer,
-        is_https,
+        is_https && spoofer.is_none(),
         "client",
         chunk_size,
     ));
@@ -154,12 +160,17 @@ async fn forward(
     }
 
     let mut buf = [0u8; 4096];
+    let mut first = true;
     loop {
         let n = reader.read(&mut buf).await?;
         if n == 0 {
             writer.shutdown().await?;
             log::debug!("Connection closed by {name}");
             return Ok(());
+        }
+        if first {
+            log::debug!("first {n} bytes from {name}: {:02x?}", &buf[..n.min(32)]);
+            first = false;
         }
         writer.write_all(&buf[..n]).await?;
     }
@@ -305,7 +316,7 @@ mod tests {
             .unwrap();
         let proxy_task = tokio::spawn(async move {
             let (stream, _) = proxy_listener.accept().await.unwrap();
-            super::proxy(stream, &resolver, CHUNK_SIZE).await
+            super::proxy(stream, &resolver, CHUNK_SIZE, None).await
         });
 
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
