@@ -16,7 +16,10 @@ pub struct Args {
 
     #[arg(short = 'u', long)]
     pub dns_udp_server: Option<String>,
-    
+
+    #[arg(short = 'H', long)]
+    pub dns_https_server: Option<String>,
+
     // #[arg(short = 'H', long)]
     // pub doh_server: Option<Vec<String>>,
     #[arg(short = 'c', long, default_value = "500")]

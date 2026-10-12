@@ -22,6 +22,7 @@ async fn main() -> io::Result<()> {
         dot_server,
         dns_tcp_server,
         dns_udp_server,
+        dns_https_server,
         // doh_server,
         verbose,
     } = args;
@@ -39,6 +40,8 @@ async fn main() -> io::Result<()> {
         (dns_tcp_server.unwrap(), DNSServerKind::TCP)
     } else if dns_udp_server.is_some() {
         (dns_udp_server.unwrap(), DNSServerKind::UDP)
+    } else if dns_https_server.is_some() {
+        (dns_https_server.unwrap(), DNSServerKind::HTTPS)
     } else {
         (dot_server, DNSServerKind::TLS)
     };

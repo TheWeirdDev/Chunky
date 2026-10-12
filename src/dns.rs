@@ -1,3 +1,5 @@
+use hickory_proto::op::{Message, Query};
+use hickory_proto::rr::{Name, RecordType};
 use hickory_resolver::config::{NameServerConfig, NameServerConfigGroup, ResolverConfig};
 use hickory_resolver::name_server::TokioConnectionProvider;
 use hickory_resolver::AsyncResolver;
@@ -10,22 +12,37 @@ pub enum DNSServerKind {
     TCP,
     UDP,
     TLS,
+    HTTPS,
+}
+
+enum Upstream {
+    Hickory(AsyncResolver<TokioConnectionProvider>),
+    Https {
+        client: reqwest::Client,
+        url: String,
+    },
 }
 
 pub struct CachedResolver {
-    resolver: AsyncResolver<TokioConnectionProvider>,
+    upstream: Upstream,
     cache: Mutex<HashMap<String, IpAddr>>,
 }
 
 impl CachedResolver {
     pub async fn new(dns_server: &str, kind: DNSServerKind) -> io::Result<Self> {
-        let resolver = match kind {
-            DNSServerKind::TLS => create_dot_resolver(dns_server).await?,
-            DNSServerKind::TCP => create_tcp_resolver(dns_server).await?,
-            DNSServerKind::UDP => create_udp_resolver(dns_server).await?,
+        let upstream = match kind {
+            DNSServerKind::TLS => Upstream::Hickory(create_dot_resolver(dns_server).await?),
+            DNSServerKind::TCP => Upstream::Hickory(create_tcp_resolver(dns_server).await?),
+            DNSServerKind::UDP => Upstream::Hickory(create_udp_resolver(dns_server).await?),
+            DNSServerKind::HTTPS => Upstream::Https {
+                client: reqwest::Client::builder()
+                    .build()
+                    .map_err(io::Error::other)?,
+                url: dns_server.to_string(),
+            },
         };
         Ok(Self {
-            resolver,
+            upstream,
             cache: Mutex::new(HashMap::new()),
         })
     }
@@ -41,8 +58,10 @@ impl CachedResolver {
             return Ok(*ip);
         }
         log::debug!("cache miss for {host}, resolving...");
-        let response = self.resolver.lookup_ip(&host).await?;
-        let mut ips = response.iter().collect::<Vec<_>>();
+        let mut ips = match &self.upstream {
+            Upstream::Hickory(resolver) => resolver.lookup_ip(&host).await?.iter().collect(),
+            Upstream::Https { client, url } => doh_lookup(client, url, &host).await?,
+        };
         if ips.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -73,6 +92,45 @@ pub async fn create_dot_resolver(
         ),
         Default::default(),
     ))
+}
+
+async fn doh_lookup(
+    client: &reqwest::Client,
+    url: &str,
+    host: &str,
+) -> io::Result<Vec<IpAddr>> {
+    let name = Name::from_ascii(host).map_err(io::Error::other)?;
+    let mut ips = Vec::new();
+    for record_type in [RecordType::A, RecordType::AAAA] {
+        let mut request = Message::new();
+        request
+            .set_id(0)
+            .set_recursion_desired(true)
+            .add_query(Query::query(name.clone(), record_type));
+        let body = request.to_vec().map_err(io::Error::other)?;
+
+        let response = client
+            .post(url)
+            .header("content-type", "application/dns-message")
+            .header("accept", "application/dns-message")
+            .body(body)
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+            .map_err(io::Error::other)?
+            .bytes()
+            .await
+            .map_err(io::Error::other)?;
+
+        let message = Message::from_vec(&response).map_err(io::Error::other)?;
+        ips.extend(
+            message
+                .answers()
+                .iter()
+                .filter_map(|record| record.data().and_then(|data| data.ip_addr())),
+        );
+    }
+    Ok(ips)
 }
 
 pub async fn create_tcp_resolver(
