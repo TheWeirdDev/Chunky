@@ -21,6 +21,9 @@ url = "2.5.4"
 env_logger = "0.11.6"
 log = "0.4.22"
 openssl = { version = "0.10.68", features = ["vendored"] }
+
+# SNI spoofing needs AF_PACKET, which only Linux and Android have.
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 pnet_packet = "0.33"
 libc = "0.2"
 rand = "0.8"

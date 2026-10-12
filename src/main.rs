@@ -2,7 +2,44 @@ mod args;
 mod dns;
 mod handler;
 mod http;
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod spoof;
+
+/// SNI spoofing needs AF_PACKET sockets, which only Linux and Android have. Elsewhere `--fake-sni`
+/// is accepted but fails at startup.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+mod spoof {
+    use std::io;
+    use std::net::IpAddr;
+
+    use tokio::net::TcpStream;
+
+    fn unsupported() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "--fake-sni is only supported on Linux and Android, not on {}",
+                std::env::consts::OS
+            ),
+        )
+    }
+
+    pub fn has_cap_net_raw() -> bool {
+        true
+    }
+
+    pub struct Spoofer;
+
+    impl Spoofer {
+        pub fn start(_fake_sni: &str) -> io::Result<Self> {
+            Err(unsupported())
+        }
+
+        pub async fn connect(&self, _remote: IpAddr, _port: u16) -> io::Result<TcpStream> {
+            Err(unsupported())
+        }
+    }
+}
 
 use std::sync::Arc;
 
@@ -71,7 +108,7 @@ async fn main() -> io::Result<()> {
             let spoofer = Spoofer::start(&sni).map_err(|e| {
                 io::Error::new(
                     e.kind(),
-                    format!("SNI spoofing could not start: {e}. It needs CAP_NET_RAW, e.g. `sudo setcap cap_net_raw+ep <binary>`"),
+                    format!("SNI spoofing could not start: {e}"),
                 )
             })?;
             log::info!("Chunking is disabled while SNI spoofing is on");
