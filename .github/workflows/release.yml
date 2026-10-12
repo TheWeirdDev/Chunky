@@ -88,13 +88,17 @@ jobs:
       - name: Configure Android toolchain
         if: matrix.target == 'aarch64-linux-android'
         run: |
-          BIN="${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          NDK="${{ steps.ndk.outputs.ndk-path }}"
+          BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
           {
-            echo "ANDROID_NDK_HOME=${{ steps.ndk.outputs.ndk-path }}"
+            echo "ANDROID_NDK_HOME=$NDK"
+            echo "ANDROID_NDK_ROOT=$NDK"
             echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$BIN/aarch64-linux-android21-clang"
             echo "CC_aarch64_linux_android=$BIN/aarch64-linux-android21-clang"
             echo "AR_aarch64_linux_android=$BIN/llvm-ar"
           } >> "$GITHUB_ENV"
+          # OpenSSL's build runs the NDK tools by name, so they must be on PATH.
+          echo "$BIN" >> "$GITHUB_PATH"
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
           bin: chunky
