@@ -79,6 +79,27 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+
+      # iOS: build with Xcode, ad-hoc sign, and upload as a zip like the other assets.
+      - name: Build iOS
+        if: matrix.target == 'aarch64-apple-ios'
+        run: |
+          rustup target add ${{ matrix.target }}
+          cargo build --release --target ${{ matrix.target }}
+      - name: Sign iOS binary
+        if: matrix.target == 'aarch64-apple-ios'
+        run: codesign --force -s - target/${{ matrix.target }}/release/chunky
+      - name: Upload iOS binary
+        if: matrix.target == 'aarch64-apple-ios'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/chunky dist/chunky
+          cd dist && zip -q -j chunky-${{ matrix.target }}.zip chunky
+          gh release upload "${{ github.ref_name }}" chunky-${{ matrix.target }}.zip --clobber
+
+      # Android: the same NDK setup as before, then the upload action.
       - name: Set up Android NDK
         if: matrix.target == 'aarch64-linux-android'
         id: ndk
@@ -100,6 +121,7 @@ jobs:
           # OpenSSL's build runs the NDK tools by name, so they must be on PATH.
           echo "$BIN" >> "$GITHUB_PATH"
       - uses: taiki-e/upload-rust-binary-action@v1
+        if: matrix.target == 'aarch64-linux-android'
         with:
           bin: chunky
           tar: none
@@ -108,6 +130,7 @@ jobs:
           archive: chunky-$target
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   changelog:
     runs-on: ubuntu-24.04
     steps:
