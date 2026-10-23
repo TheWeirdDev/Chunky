@@ -169,7 +169,6 @@ async fn forward(
             return Ok(());
         }
         if first {
-            log::debug!("first {n} bytes from {name}: {:02x?}", &buf[..n.min(32)]);
             first = false;
         }
         writer.write_all(&buf[..n]).await?;
