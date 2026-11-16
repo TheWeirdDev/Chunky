@@ -44,7 +44,11 @@ pub struct CachedResolver {
 }
 
 impl CachedResolver {
-    pub async fn new(dns_server: &str, kind: DNSServerKind, prefer: IpPreference) -> io::Result<Self> {
+    pub async fn new(
+        dns_server: &str,
+        kind: DNSServerKind,
+        prefer: IpPreference,
+    ) -> io::Result<Self> {
         let upstream = match kind {
             DNSServerKind::Tls => Upstream::Hickory(create_tls_resolver(dns_server).await?),
             DNSServerKind::Tcp => {
@@ -66,20 +70,27 @@ impl CachedResolver {
     }
 
     /// Returns every address for `host`, best first, so callers can fall back to the next one.
+    #[deprecated(note = "use `lookup_ips_for`, which borrows the host instead of consuming it")]
+    #[allow(dead_code)]
     pub async fn lookup_ips(&self, host: String) -> io::Result<Vec<IpAddr>> {
+        self.lookup_ips_for(&host).await
+    }
+
+    /// Returns every address for `host`, best first, so callers can fall back to the next one.
+    pub async fn lookup_ips_for(&self, host: &str) -> io::Result<Vec<IpAddr>> {
         // Check if host is already an IP address
         if let Ok(ip) = host.parse::<IpAddr>() {
             return Ok(vec![ip]);
         }
 
-        if let Some(ips) = self.cache.lock().await.get(&host) {
+        if let Some(ips) = self.cache.lock().await.get(host) {
             log::debug!("cache hit for {host}");
             return Ok(ips.clone());
         }
         log::debug!("cache miss for {host}, resolving...");
         let ips: Vec<IpAddr> = match &self.upstream {
-            Upstream::Hickory(resolver) => resolver.lookup_ip(&host).await?.iter().collect(),
-            Upstream::Https { endpoints, url } => doh_lookup_any(endpoints, url, &host).await?,
+            Upstream::Hickory(resolver) => resolver.lookup_ip(host).await?.iter().collect(),
+            Upstream::Https { endpoints, url } => doh_lookup_any(endpoints, url, host).await?,
         };
         let ordered = order_ips(&ips, self.prefer);
         if ordered.is_empty() {
@@ -88,7 +99,10 @@ impl CachedResolver {
                 "No IP addresses found",
             ));
         }
-        self.cache.lock().await.insert(host, ordered.clone());
+        self.cache
+            .lock()
+            .await
+            .insert(host.to_owned(), ordered.clone());
         Ok(ordered)
     }
 }
@@ -98,7 +112,11 @@ impl CachedResolver {
 /// is kept, and duplicates are removed.
 fn order_ips(ips: &[IpAddr], prefer: IpPreference) -> Vec<IpAddr> {
     let (v4, v6): (Vec<IpAddr>, Vec<IpAddr>) = ips.iter().copied().partition(IpAddr::is_ipv4);
-    let families = if prefer == IpPreference::Ipv6 { [v6, v4] } else { [v4, v6] };
+    let families = if prefer == IpPreference::Ipv6 {
+        [v6, v4]
+    } else {
+        [v4, v6]
+    };
     let mut ordered = Vec::with_capacity(ips.len());
     for ip in families.into_iter().flatten() {
         if !ordered.contains(&ip) {
@@ -108,11 +126,7 @@ fn order_ips(ips: &[IpAddr], prefer: IpPreference) -> Vec<IpAddr> {
     ordered
 }
 
-async fn doh_lookup(
-    client: &reqwest::Client,
-    url: &str,
-    host: &str,
-) -> io::Result<Vec<IpAddr>> {
+async fn doh_lookup(client: &reqwest::Client, url: &str, host: &str) -> io::Result<Vec<IpAddr>> {
     let name = Name::from_ascii(host).map_err(io::Error::other)?;
     let mut ips = Vec::new();
     for record_type in [RecordType::A, RecordType::AAAA] {
@@ -174,7 +188,11 @@ async fn create_doh_endpoints(dns_server: &str) -> io::Result<Vec<DohEndpoint>> 
 }
 
 /// Tries each DoH endpoint in order and returns the first successful answer.
-async fn doh_lookup_any(endpoints: &[DohEndpoint], url: &str, host: &str) -> io::Result<Vec<IpAddr>> {
+async fn doh_lookup_any(
+    endpoints: &[DohEndpoint],
+    url: &str,
+    host: &str,
+) -> io::Result<Vec<IpAddr>> {
     let mut last_err = None;
     for (ip, client) in endpoints {
         match doh_lookup(client, url, host).await {
@@ -217,7 +235,10 @@ async fn create_tls_resolver(dns_server: &str) -> io::Result<HickoryResolver> {
 }
 
 /// Plain TCP or UDP resolver on port 53. Only the first resolved address is used.
-async fn create_plain_resolver(dns_server: &str, protocol: Protocol) -> io::Result<HickoryResolver> {
+async fn create_plain_resolver(
+    dns_server: &str,
+    protocol: Protocol,
+) -> io::Result<HickoryResolver> {
     const PORT: u16 = 53;
     let ips = resolve_server_ips(dns_server, PORT).await?;
     let server = NameServerConfig {
@@ -271,8 +292,14 @@ mod tests {
 
     #[test]
     fn order_ips_keeps_dns_order_within_a_family() {
-        assert_eq!(order_ips(&[v4(2), v4(1)], IpPreference::Any), vec![v4(2), v4(1)]);
-        assert_eq!(order_ips(&[v6(2), v6(1)], IpPreference::Any), vec![v6(2), v6(1)]);
+        assert_eq!(
+            order_ips(&[v4(2), v4(1)], IpPreference::Any),
+            vec![v4(2), v4(1)]
+        );
+        assert_eq!(
+            order_ips(&[v6(2), v6(1)], IpPreference::Any),
+            vec![v6(2), v6(1)]
+        );
     }
 
     #[test]
@@ -362,7 +389,9 @@ mod tests {
             pinned_endpoint([127, 0, 0, 2], port),
             pinned_endpoint([127, 0, 0, 1], port),
         ];
-        let ips = doh_lookup_any(&endpoints, &url, "example.org").await.unwrap();
+        let ips = doh_lookup_any(&endpoints, &url, "example.org")
+            .await
+            .unwrap();
         assert!(!ips.is_empty());
         assert!(ips.iter().all(|ip| *ip == IpAddr::from([192, 0, 2, 1])));
     }
@@ -375,6 +404,8 @@ mod tests {
             pinned_endpoint([127, 0, 0, 2], port),
             pinned_endpoint([127, 0, 0, 3], port),
         ];
-        assert!(doh_lookup_any(&endpoints, &url, "example.org").await.is_err());
+        assert!(doh_lookup_any(&endpoints, &url, "example.org")
+            .await
+            .is_err());
     }
 }

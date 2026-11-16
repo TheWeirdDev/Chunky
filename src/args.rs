@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::Parser;
 
 #[derive(Parser, Debug)]
@@ -33,6 +35,37 @@ pub struct Args {
 
     #[arg(short = 'c', long, default_value = "500")]
     pub chunk_size: usize,
+
+    /// Bypass chunking and SNI spoofing for this IP or CIDR. Repeatable, or comma-separated.
+    #[arg(long, value_name = "IP|CIDR", value_delimiter = ',')]
+    pub bypass_ip: Vec<String>,
+
+    /// Bypass this domain. Supports `*.example.com` and `.example.com` (apex + subdomains).
+    /// Repeatable, or comma-separated.
+    #[arg(long, value_name = "PATTERN", value_delimiter = ',')]
+    pub bypass_domain: Vec<String>,
+
+    /// Bypass every host under this top-level domain, e.g. `ir` or `co.uk`.
+    /// Repeatable, or comma-separated.
+    #[arg(long, value_name = "TLD", value_delimiter = ',')]
+    pub bypass_tld: Vec<String>,
+
+    /// Bypass addresses located in this two-letter country (requires --geoip-db).
+    /// Repeatable, or comma-separated.
+    #[arg(long, value_name = "COUNTRY", value_delimiter = ',')]
+    pub bypass_geoip: Vec<String>,
+
+    /// MaxMind GeoLite2-Country or DB-IP country database used by --bypass-geoip.
+    #[arg(long, value_name = "PATH")]
+    pub geoip_db: Option<PathBuf>,
+
+    /// Load bypass rules from a file. Repeatable.
+    #[arg(long, value_name = "PATH")]
+    pub bypass_file: Vec<PathBuf>,
+
+    /// Bypass loopback, private, link-local, and CGNAT addresses.
+    #[arg(long)]
+    pub bypass_private: bool,
 
     #[arg(short = 'v', long)]
     pub verbose: bool,

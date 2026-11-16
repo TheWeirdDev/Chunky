@@ -7,6 +7,7 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 use tokio::{select, time::timeout};
 
+use crate::bypass::BypassList;
 use crate::dns::CachedResolver;
 use crate::http;
 use crate::spoof::Spoofer;
@@ -16,6 +17,7 @@ pub async fn proxy(
     resolver: &CachedResolver,
     chunk_size: usize,
     spoofer: Option<&Spoofer>,
+    bypass: &BypassList,
 ) -> io::Result<()> {
     let addr = stream.peer_addr()?;
     let (reader, mut writer) = stream.into_split();
@@ -30,13 +32,29 @@ pub async fn proxy(
     } = http::parse_http_request(&req_line)?;
 
     log::debug!("new connection from {addr:?} to {host}:{port}");
-    let ips = resolver.lookup_ips(host).await?;
+    let ips = resolver.lookup_ips_for(&host).await?;
     log::debug!("resolved host: {ips:?}");
 
-    let upstream = match spoofer {
-        Some(spoofer) => connect_any_with(&ips, CONNECT_TIMEOUT, |ip| spoofer.connect(ip, port)).await?,
-        None => connect_any(&ips, port).await?,
+    let bypassed = bypass.check(&host, &ips);
+    // Bypassed connections only use the addresses the rules selected.
+    let ips = match &bypassed {
+        Some(found) => {
+            log::debug!(
+                "bypassing {host} ({}): chunking and SNI spoofing disabled",
+                found.reason
+            );
+            found.ips.clone()
+        }
+        None => ips,
     };
+
+    let upstream = connect_upstream(
+        &ips,
+        port,
+        spoofer.map(|spoofer| move |ip| spoofer.connect(ip, port)),
+        bypassed.is_some(),
+    )
+    .await?;
     let (upstream_reader, mut upstream_writer) = upstream.into_split();
     let upstream_reader = BufReader::new(upstream_reader);
 
@@ -50,11 +68,11 @@ pub async fn proxy(
     }
 
     // Only the client's TLS ClientHello is split; the server's replies are forwarded as-is.
-    // With SNI spoofing on, the ClientHello is sent whole.
+    // With SNI spoofing on, the ClientHello is sent whole. Bypassed destinations are plain tunnels.
     let client_to_server = tokio::spawn(forward(
         reader,
         upstream_writer,
-        is_https && spoofer.is_none(),
+        is_https && spoofer.is_none() && bypassed.is_none(),
         "client",
         chunk_size,
     ));
@@ -78,6 +96,23 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Connects to the first address in `ips` that accepts the connection within `CONNECT_TIMEOUT`.
 /// Returns the last connection error if none do.
+/// Connects with `spoof` when given, unless the destination is bypassed (plain connect then).
+async fn connect_upstream<F, Fut>(
+    ips: &[IpAddr],
+    port: u16,
+    spoof: Option<F>,
+    bypassed: bool,
+) -> io::Result<TcpStream>
+where
+    F: Fn(IpAddr) -> Fut,
+    Fut: std::future::Future<Output = io::Result<TcpStream>>,
+{
+    match spoof {
+        Some(spoof) if !bypassed => connect_any_with(ips, CONNECT_TIMEOUT, spoof).await,
+        _ => connect_any(ips, port).await,
+    }
+}
+
 async fn connect_any(ips: &[IpAddr], port: u16) -> io::Result<TcpStream> {
     connect_any_with(ips, CONNECT_TIMEOUT, |ip| TcpStream::connect((ip, port))).await
 }
@@ -105,9 +140,8 @@ where
             }
         }
     }
-    Err(last_err.unwrap_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, "No addresses to connect to")
-    }))
+    Err(last_err
+        .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "No addresses to connect to")))
 }
 
 /// Reads the request line and the header block, up to the blank line that ends them.
@@ -196,6 +230,7 @@ fn chunk_tls_record(header: &[u8], payload: &[u8], chunk_size: usize) -> Vec<u8>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bypass::BypassList;
 
     #[test]
     fn detects_tls_handshake_header() {
@@ -215,7 +250,10 @@ mod tests {
         // Nothing listens on 127.0.0.2, so the first address is refused.
         let ips = [IpAddr::from([127, 0, 0, 2]), IpAddr::from([127, 0, 0, 1])];
         let stream = connect_any(&ips, port).await.unwrap();
-        assert_eq!(stream.peer_addr().unwrap().ip(), IpAddr::from([127, 0, 0, 1]));
+        assert_eq!(
+            stream.peer_addr().unwrap().ip(),
+            IpAddr::from([127, 0, 0, 1])
+        );
     }
 
     #[tokio::test]
@@ -236,7 +274,10 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(stream.peer_addr().unwrap().ip(), IpAddr::from([127, 0, 0, 1]));
+        assert_eq!(
+            stream.peer_addr().unwrap().ip(),
+            IpAddr::from([127, 0, 0, 1])
+        );
     }
 
     #[tokio::test]
@@ -277,25 +318,16 @@ mod tests {
         );
     }
 
-    /// Runs `proxy` for a CONNECT to a local fake upstream and checks the bytes on the wire.
-    #[tokio::test]
-    async fn proxy_chunks_client_hello_only() {
+    const CHUNK_SIZE: usize = 4;
+    const CLIENT_RECORD: [u8; 15] = [0x16, 0x03, 0x01, 0x00, 0x0a, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    const PING: &[u8] = b"ping";
+    const SERVER_REPLY: [u8; 10] = [0x16, 0x03, 0x03, 0x00, 0x05, b'h', b'e', b'l', b'l', b'o'];
+
+    /// Runs `proxy` for a CONNECT to a local fake upstream and returns the bytes it received.
+    async fn run_proxy_roundtrip(bypass: BypassList, expected_upstream: Vec<u8>) {
         use crate::dns::{CachedResolver, DNSServerKind, IpPreference};
         use tokio::net::{TcpListener, TcpStream};
         use tokio::time::{timeout, Duration};
-
-        const CHUNK_SIZE: usize = 4;
-        let client_record = [0x16, 0x03, 0x01, 0x00, 0x0a, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
-        let ping = b"ping";
-        let server_reply = [0x16, 0x03, 0x03, 0x00, 0x05, b'h', b'e', b'l', b'l', b'o'];
-        // The 10-byte record is split into 4+4+2 records, each with the original 3-byte header.
-        // Everything after the record is forwarded unchanged.
-        let mut expected_upstream = vec![
-            0x16, 0x03, 0x01, 0x00, 0x04, 1, 2, 3, 4, //
-            0x16, 0x03, 0x01, 0x00, 0x04, 5, 6, 7, 8, //
-            0x16, 0x03, 0x01, 0x00, 0x02, 9, 10,
-        ];
-        expected_upstream.extend_from_slice(ping);
 
         let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream_port = upstream_listener.local_addr().unwrap().port();
@@ -304,7 +336,7 @@ mod tests {
             let (mut sock, _) = upstream_listener.accept().await.unwrap();
             let mut received = vec![0u8; upstream_len];
             sock.read_exact(&mut received).await.unwrap();
-            sock.write_all(&server_reply).await.unwrap();
+            sock.write_all(&SERVER_REPLY).await.unwrap();
             received
         });
 
@@ -315,7 +347,7 @@ mod tests {
             .unwrap();
         let proxy_task = tokio::spawn(async move {
             let (stream, _) = proxy_listener.accept().await.unwrap();
-            super::proxy(stream, &resolver, CHUNK_SIZE, None).await
+            super::proxy(stream, &resolver, CHUNK_SIZE, None, &bypass).await
         });
 
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
@@ -325,15 +357,15 @@ mod tests {
         client.read_exact(&mut established).await.unwrap();
         assert_eq!(&established, b"HTTP/1.1 200 OK\r\n\r\n");
 
-        client.write_all(&client_record).await.unwrap();
-        client.write_all(ping).await.unwrap();
+        client.write_all(&CLIENT_RECORD).await.unwrap();
+        client.write_all(PING).await.unwrap();
 
         let mut reply = [0u8; 10];
         timeout(Duration::from_secs(5), client.read_exact(&mut reply))
             .await
             .expect("timed out waiting for server reply")
             .unwrap();
-        assert_eq!(reply, server_reply);
+        assert_eq!(reply, SERVER_REPLY);
 
         let received = timeout(Duration::from_secs(5), upstream)
             .await
@@ -347,5 +379,55 @@ mod tests {
             .expect("proxy did not finish")
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn proxy_chunks_client_hello_only() {
+        // The 10-byte record is split into 4+4+2 records, each with the original 3-byte header.
+        // Everything after the record is forwarded unchanged.
+        let mut expected_upstream = vec![
+            0x16, 0x03, 0x01, 0x00, 0x04, 1, 2, 3, 4, //
+            0x16, 0x03, 0x01, 0x00, 0x04, 5, 6, 7, 8, //
+            0x16, 0x03, 0x01, 0x00, 0x02, 9, 10,
+        ];
+        expected_upstream.extend_from_slice(PING);
+        run_proxy_roundtrip(BypassList::default(), expected_upstream).await;
+    }
+
+    #[tokio::test]
+    async fn bypassed_destinations_skip_the_spoofed_connect() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let ips = [IpAddr::from([127, 0, 0, 1])];
+
+        let calls = AtomicUsize::new(0);
+        let spoofed = |_ip| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Err(io::Error::other("spoofed connect used")) }
+        };
+        assert!(connect_upstream(&ips, port, Some(spoofed), true)
+            .await
+            .is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        let spoofed = |_ip| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Err(io::Error::other("spoofed connect used")) }
+        };
+        assert!(connect_upstream(&ips, port, Some(spoofed), false)
+            .await
+            .is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn proxy_does_not_chunk_bypassed_host() {
+        let mut bypass = BypassList::default();
+        bypass.add_ip("127.0.0.1").unwrap();
+
+        let mut expected_upstream = CLIENT_RECORD.to_vec();
+        expected_upstream.extend_from_slice(PING);
+        run_proxy_roundtrip(bypass, expected_upstream).await;
     }
 }

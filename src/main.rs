@@ -1,4 +1,5 @@
 mod args;
+mod bypass;
 mod dns;
 mod handler;
 mod http;
@@ -48,32 +49,21 @@ use tokio::io;
 use tokio::net::TcpListener;
 
 use crate::args::Args;
+use crate::bypass::BypassList;
 use crate::dns::{CachedResolver, DNSServerKind, IpPreference};
 use crate::spoof::Spoofer;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    let Args {
-        host,
-        port,
-        chunk_size,
-        dot_server,
-        dns_tcp_server,
-        dns_udp_server,
-        dns_https_server,
-        prefer_ipv6,
-        prefer_ipv4,
-        fake_sni,
-        verbose,
-    } = Args::parse();
+    let args = Args::parse();
 
-    let prefer = match (prefer_ipv6, prefer_ipv4) {
+    let prefer = match (args.prefer_ipv6, args.prefer_ipv4) {
         (true, _) => IpPreference::Ipv6,
         (_, true) => IpPreference::Ipv4,
         _ => IpPreference::Any,
     };
 
-    if fake_sni.is_some() && !spoof::has_cap_net_raw() {
+    if args.fake_sni.is_some() && !spoof::has_cap_net_raw() {
         let binary = std::env::current_exe()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|_| "<chunky>".to_string());
@@ -85,9 +75,28 @@ async fn main() -> io::Result<()> {
         std::process::exit(1);
     }
 
-    let env = env_logger::Env::default()
-        .filter_or("CHUNKY_LOG_LEVEL", if verbose { "debug" } else { "info" });
+    let env = env_logger::Env::default().filter_or(
+        "CHUNKY_LOG_LEVEL",
+        if args.verbose { "debug" } else { "info" },
+    );
     env_logger::init_from_env(env);
+
+    let bypass = Arc::new(BypassList::from_args(&args)?);
+    if !bypass.is_empty() {
+        log::info!("Bypass list active: matching destinations skip chunking and SNI spoofing");
+    }
+
+    let Args {
+        host,
+        port,
+        chunk_size,
+        dot_server,
+        dns_tcp_server,
+        dns_udp_server,
+        dns_https_server,
+        fake_sni,
+        ..
+    } = args;
 
     let listener = TcpListener::bind((host.as_str(), port)).await?;
     log::info!("Listening on {host}:{port}");
@@ -99,17 +108,12 @@ async fn main() -> io::Result<()> {
         _ => (dot_server, DNSServerKind::Tls),
     };
 
-    let resolver = Arc::new(
-        CachedResolver::new(&dns_server, dns_server_kind, prefer).await?,
-    );
+    let resolver = Arc::new(CachedResolver::new(&dns_server, dns_server_kind, prefer).await?);
     log::info!("DNS resolver configured. using: {dns_server}");
     let spoofer = match fake_sni {
         Some(sni) => {
             let spoofer = Spoofer::start(&sni).map_err(|e| {
-                io::Error::new(
-                    e.kind(),
-                    format!("SNI spoofing could not start: {e}"),
-                )
+                io::Error::new(e.kind(), format!("SNI spoofing could not start: {e}"))
             })?;
             log::info!("Chunking is disabled while SNI spoofing is on");
             Some(Arc::new(spoofer))
@@ -124,8 +128,11 @@ async fn main() -> io::Result<()> {
         let (client, _) = listener.accept().await?;
         let resolver = resolver.clone();
         let spoofer = spoofer.clone();
+        let bypass = bypass.clone();
         tokio::spawn(async move {
-            if let Err(e) = handler::proxy(client, &resolver, chunk_size, spoofer.as_deref()).await {
+            if let Err(e) =
+                handler::proxy(client, &resolver, chunk_size, spoofer.as_deref(), &bypass).await
+            {
                 log::error!("Error: {e}");
             }
         });

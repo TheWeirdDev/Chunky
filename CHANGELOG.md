@@ -1,3 +1,9 @@
+# Unreleased
+- Add bypass lists: matched destinations are still proxied but skip chunking and SNI spoofing
+- Match bypass rules by IP/CIDR, exact or wildcard domain, top-level domain, and GeoIP country
+- Load rules from the command line or a `--bypass-file`, with optional `--bypass-private` ranges
+- GeoIP support is behind the `geoip` feature so the database and dependency stay optional
+
 # 0.1.0
 - Initial release
 

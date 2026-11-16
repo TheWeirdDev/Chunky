@@ -15,6 +15,13 @@ Chunky has a few configuration options that can be set using command line argume
 - `-6` or `--prefer-ipv6`: Prefer IPv6 addresses when a host has both IPv4 and IPv6. Default: **Disabled**
 - `-4` or `--prefer-ipv4`: Prefer IPv4 addresses when a host has both IPv4 and IPv6. Cannot be used with `-6`. Default: **Disabled**
 - `--fake-sni`: Spoof the SNI: send a fake ClientHello with this host name before the real one, and turn chunking off. Needs `CAP_NET_RAW` (e.g. `sudo setcap cap_net_raw+ep <binary>`). Default: **Disabled**
+- `--bypass-ip`: Bypass chunking and SNI spoofing for an IP or CIDR. Repeatable or comma-separated.
+- `--bypass-domain`: Bypass a domain, `*.example.com` wildcard, or `.example.com` (apex and subdomains). Repeatable or comma-separated.
+- `--bypass-tld`: Bypass every host under a top-level domain, e.g. `ir` or `co.uk`. Repeatable or comma-separated.
+- `--bypass-geoip`: Bypass addresses in a two-letter country code. Needs `--geoip-db`. Repeatable or comma-separated.
+- `--geoip-db`: Path to a MaxMind GeoLite2-Country or DB-IP country database. Only available when built with `--features geoip`.
+- `--bypass-file`: Load bypass rules from a file. Repeatable.
+- `--bypass-private`: Bypass loopback, private, link-local, and CGNAT addresses.
 - `-c` or `--chunk-size`: The size of each chunk in bytes. Default: **500**
 - `-v` or `--verbose`: Enable verbose logging. Default: **Disabled**
 - `-h` or `--help`: Display the help message
@@ -32,6 +39,42 @@ cargo run --release
 If the DNS server returns several addresses for a host, or a DNS-over-HTTPS server has several IPs, Chunky tries them in order. A connection attempt that fails or takes longer than 5 seconds moves on to the next address.
 
 This will start the Chunky proxy on the default host and port mentioned above. You can then **configure your browser or system to use the proxy to access the internet**.
+
+## Bypass lists
+
+Matching destinations are still proxied, but Chunky skips chunking and SNI spoofing for them, so they are tunneled unchanged. This is useful for local networks, banks, government sites, and other hosts that do not need DPI evasion or that break when their handshake is modified.
+
+Rules can be passed on the command line:
+
+```bash
+chunky --bypass-ip 10.0.0.0/8 --bypass-domain '*.internal.example' \
+       --bypass-tld ir --bypass-private
+```
+
+or loaded from a file with `--bypass-file rules.txt`:
+
+```text
+# Blank lines and text after '#' are ignored.
+ip 10.0.0.0/8
+ip 2001:db8::/32
+domain example.com
+domain *.example.com
+tld ir
+geoip CN
+```
+
+Domain patterns support `*`, `?`, and character classes. A leading dot, as in `.example.com`, matches the apex and all of its subdomains. TLD rules match on a label boundary, so `ir` matches `example.ir` but not `notir`. IP and GeoIP rules match any address the host resolves to.
+
+### GeoIP
+
+Country matching needs a local GeoIP database and a build with the `geoip` feature, because the database is not bundled:
+
+```bash
+cargo build --release --features geoip
+./target/release/chunky --geoip-db GeoLite2-Country.mmdb --bypass-geoip CN,IR
+```
+
+Both MaxMind GeoLite2-Country and DB-IP country databases in MaxMind DB format work. Without the feature, `--geoip-db` and `--bypass-geoip` are rejected at startup.
 
 ## Building for Android and iOS
 
