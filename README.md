@@ -1,28 +1,49 @@
 # Chunky
 
-Chunky is a lightweight http(s) proxy designed to circumvent censorship in countries where internet access is restricted. It works by chunking the TLS handshake and making it difficult for deep packet inspection (DPI) to detect and block the handshake.
+Chunky is a lightweight HTTP(S), SOCKS4/4a, and SOCKS5 proxy designed to circumvent censorship in countries where internet access is restricted. It works by splitting or spoofing the TLS ClientHello so deep packet inspection (DPI) cannot detect and block the handshake.
+
+## Features
+
+- **Unified HTTP(S) + SOCKS4/4a + SOCKS5 listener** on a single port (auto-detected per connection), supporting all plain HTTP methods (`GET`, `POST`, `PUT`, `DELETE`, `HEAD`, `OPTIONS`, `PATCH`, etc.) and `CONNECT`
+- **SNI & ECH-aware TLS splitting** (`--split-sni`) with `TCP_NODELAY`, plus configurable `--chunk-size`
+- **SNI spoofing (`--fake-sni`)** on Linux and Android across IPv4, IPv6, and multiple interfaces, with optional `--fake-ttl` and `--fake-bad-checksum`
+- **Encrypted & resilient DNS** via DoT, DoH (concurrent `A`/`AAAA` queries), TCP, or UDP, with `--dns-bootstrap`, TTL/LRU caching, and RFC 8305 Happy Eyeballs connection racing
+- **Blocklist (`bypass`) and Allowlist (`evade`) rules** by IP/CIDR, domain/wildcard, TLD, GeoIP country, private ranges, or rule files
+- **TOML configuration (`--config`) with `SIGHUP` hot-reload**, **Basic / SOCKS5 proxy authentication (`--auth`)**, and an integrated **PAC endpoint (`/proxy.pac`)**
 
 ## Configuration
 
-Chunky has a few configuration options that can be set using command line arguments. The following options are available:
+The following CLI options are available (all can also be configured via a TOML file passed to `--config`, with CLI flags overriding TOML values):
 
+- `-C` or `--config`: Path to a TOML configuration file (reloaded on `SIGHUP` on Unix).
 - `--host`: The host to listen on. Default: **127.0.0.1**
-- `--port`: The port to listen on. Default: **8000**
+- `--port`: The port to listen on (accepts both HTTP/HTTPS and SOCKS5). Default: **8000**
 - `-T` or `--dot-server`: The DNS-over-TLS server to use. Default: **1.1.1.1**
 - `-t` or `--dns-tcp-server`: Use a plain DNS-over-TCP server instead of DNS-over-TLS. Takes an IP or hostname.
 - `-u` or `--dns-udp-server`: Use a plain DNS-over-UDP server instead of DNS-over-TLS. Takes an IP or hostname.
 - `-H` or `--dns-https-server`: Use a DNS-over-HTTPS server instead of DNS-over-TLS. Takes a URL, e.g. `https://dns.google/dns-query`.
+- `--dns-bootstrap`: Bootstrap IP(s) for DoH/DoT server hostnames (avoids OS DNS). Repeatable or comma-separated.
+- `--dns-cache-ttl`: Max DNS cache TTL in seconds (`0` disables caching). Default: **300**
+- `--dns-cache-capacity`: Max entries in the DNS cache. Default: **4096**
 - `-6` or `--prefer-ipv6`: Prefer IPv6 addresses when a host has both IPv4 and IPv6. Default: **Disabled**
 - `-4` or `--prefer-ipv4`: Prefer IPv4 addresses when a host has both IPv4 and IPv6. Cannot be used with `-6`. Default: **Disabled**
-- `--fake-sni`: Spoof the SNI: send a fake ClientHello with this host name before the real one, and turn chunking off. Needs `CAP_NET_RAW` (e.g. `sudo setcap cap_net_raw+ep <binary>`). Default: **Disabled**
-- `--bypass-ip`: Bypass chunking and SNI spoofing for an IP or CIDR. Repeatable or comma-separated.
-- `--bypass-domain`: Bypass a domain, `*.example.com` wildcard, or `.example.com` (apex and subdomains). Repeatable or comma-separated.
-- `--bypass-tld`: Bypass every host under a top-level domain, e.g. `ir` or `co.uk`. Repeatable or comma-separated.
-- `--bypass-geoip`: Bypass addresses in a two-letter country code. Needs `--geoip-db`. Repeatable or comma-separated.
+- `--fake-sni`: Spoof the SNI: inject a fake ClientHello with this host name before the real one. Needs `CAP_NET_RAW` (e.g. `sudo setcap cap_net_raw+ep <binary>`). Supports IPv4, IPv6, and dynamic multi-interface routing on Linux/Android. Default: **Disabled**
+- `--fake-ttl`: IP TTL (or IPv6 hop limit) for injected fake ClientHello packets (`1..=255`). Sends the fake ClientHello in-sequence so it expires before reaching the origin server.
+- `--fake-bad-checksum`: Deliberately corrupt the TCP checksum on injected fake ClientHello packets so the origin server drops them while DPI inspects them.
+- `-c` or `--chunk-size`: The size of each TLS ClientHello chunk in bytes. Default: **500**
+- `--split-sni`: Parse the TLS ClientHello and split at SNI (`0x0000`) and ECH (`0xfe0d`) extension boundaries with `TCP_NODELAY`.
+- `--rule-mode`: `bypass` (default: evade everything except bypass rules) or `evade` (allowlist: evade only evade rules).
+- `--bypass-ip` / `--evade-ip`: Bypass or allowlist an IP or CIDR. Repeatable or comma-separated.
+- `--bypass-domain` / `--evade-domain`: Match a domain, `*.example.com` wildcard, or `.example.com` (apex and subdomains). Repeatable or comma-separated.
+- `--bypass-tld` / `--evade-tld`: Match every host under a top-level domain, e.g. `ir` or `co.uk`. Repeatable or comma-separated.
+- `--bypass-geoip` / `--evade-geoip`: Match addresses in a two-letter country code. Needs `--geoip-db`. Repeatable or comma-separated.
 - `--geoip-db`: Path to a MaxMind GeoLite2-Country or DB-IP country database. Only available when built with `--features geoip`.
-- `--bypass-file`: Load bypass rules from a file. Repeatable.
+- `--bypass-file` / `--evade-file`: Load rules from a file. Repeatable.
 - `--bypass-private`: Bypass loopback, private, link-local, and CGNAT addresses.
-- `-c` or `--chunk-size`: The size of each chunk in bytes. Default: **500**
+- `--auth`: Require HTTP Basic (`Proxy-Authorization`) and SOCKS5 username/password authentication (`USER:PASS`). Repeatable.
+- `--pac-path`: HTTP path to serve the PAC (`FindProxyForURL`) script on. Default: **/proxy.pac**
+- `--no-pac`: Disable the PAC HTTP endpoint.
+- `--pac-proxy`: Override the `PROXY host:port` address returned by the PAC script.
 - `-v` or `--verbose`: Enable verbose logging. Default: **Disabled**
 - `-h` or `--help`: Display the help message
 
@@ -30,28 +51,51 @@ Chunky has a few configuration options that can be set using command line argume
 
 To run Chunky, you need to have the Rust toolchain installed. You can install it by following the instructions [here](https://www.rust-lang.org/tools/install).
 
-Once you have the Rust toolchain installed, you can run the following command to build and run Chunky:
-
 ```bash
 cargo run --release
 ```
 
-If the DNS server returns several addresses for a host, or a DNS-over-HTTPS server has several IPs, Chunky tries them in order. A connection attempt that fails or takes longer than 5 seconds moves on to the next address.
+Chunky listens for both HTTP/HTTPS proxy requests and SOCKS5 connections on `--host:--port`. Upstream addresses are raced using RFC 8305 Happy Eyeballs (250ms stagger, 5s timeout per attempt).
 
-This will start the Chunky proxy on the default host and port mentioned above. You can then **configure your browser or system to use the proxy to access the internet**.
+### TOML Config & Hot Reload
 
-## Bypass lists
+Example `chunky.toml`:
 
-Matching destinations are still proxied, but Chunky skips chunking and SNI spoofing for them, so they are tunneled unchanged. This is useful for local networks, banks, government sites, and other hosts that do not need DPI evasion or that break when their handshake is modified.
+```toml
+host = "127.0.0.1"
+port = 8000
+auth = ["alice:secret"]
+pac_path = "/proxy.pac"
 
-Rules can be passed on the command line:
+[tls]
+chunk_size = 500
+split_sni = true
+# fake_sni = "www.speedtest.net"
+# fake_ttl = 3
+# fake_bad_checksum = false
 
-```bash
-chunky --bypass-ip 10.0.0.0/8 --bypass-domain '*.internal.example' \
-       --bypass-tld ir --bypass-private
+[dns]
+mode = "https"
+server = "https://dns.google/dns-query"
+bootstrap = ["8.8.8.8", "8.8.4.4"]
+prefer = "ipv4"
+cache_ttl = 300
+cache_capacity = 4096
+
+[rules]
+mode = "bypass"
+bypass_private = true
+bypass_tld = ["ir"]
+bypass_file = ["bypass.txt"]
 ```
 
-or loaded from a file with `--bypass-file rules.txt`:
+Run with `chunky --config chunky.toml`, and send `SIGHUP` (`kill -HUP <pid>`) to hot-reload the TOML config, rule files, DNS resolver, and auth credentials without dropping active connections.
+
+## Bypass and Allowlist Rules
+
+In `bypass` mode (default), matching destinations are still proxied, but Chunky skips chunking and SNI spoofing for them. In `evade` allowlist mode (`--rule-mode evade`, or automatically whenever any `--evade-*` flag is used), **only** destinations matching `--evade-*` rules receive DPI evasion (while any `--bypass-*` rules act as exclusions).
+
+Rules can be passed on the command line or loaded from a file (`--bypass-file` / `--evade-file`):
 
 ```text
 # Blank lines and text after '#' are ignored.
@@ -74,7 +118,7 @@ cargo build --release --features geoip
 ./target/release/chunky --geoip-db GeoLite2-Country.mmdb --bypass-geoip CN,IR
 ```
 
-Both MaxMind GeoLite2-Country and DB-IP country databases in MaxMind DB format work. Without the feature, `--geoip-db` and `--bypass-geoip` are rejected at startup.
+Both MaxMind GeoLite2-Country and DB-IP country databases in MaxMind DB format work. Without the feature, `--geoip-db`, `--bypass-geoip`, and `--evade-geoip` are rejected at startup.
 
 ## Building for Android and iOS
 

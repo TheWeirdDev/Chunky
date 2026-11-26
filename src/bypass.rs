@@ -90,6 +90,110 @@ fn find_range<T: Ord + Copy>(ranges: &[(T, T, IpNet)], value: T) -> Option<IpNet
     (value <= *end).then_some(*net)
 }
 
+/// How routing rules decide whether to apply DPI evasion (chunking / SNI spoofing).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RuleMode {
+    /// Evade everything except destinations matching `bypass` rules.
+    #[default]
+    Bypass,
+    /// Allowlist mode: evade only destinations matching `evade` rules (and not `bypass`).
+    Evade,
+}
+
+/// Decision for a single destination: whether to apply evasion and which IPs to connect to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PolicyDecision {
+    pub evade: bool,
+    pub reason: Option<String>,
+    pub ips: Vec<IpAddr>,
+}
+
+/// Combines `bypass` (blocklist/exclusions) and `evade` (allowlist) rule lists.
+#[derive(Default)]
+pub struct EvadePolicy {
+    mode: RuleMode,
+    bypass: BypassList,
+    evade: BypassList,
+}
+
+impl EvadePolicy {
+    pub fn new(mode: RuleMode, bypass: BypassList, evade: BypassList) -> Self {
+        Self {
+            mode,
+            bypass,
+            evade,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn from_bypass(bypass: BypassList) -> Self {
+        Self {
+            mode: RuleMode::Bypass,
+            bypass,
+            evade: BypassList::default(),
+        }
+    }
+
+    pub fn mode(&self) -> RuleMode {
+        self.mode
+    }
+
+    pub fn bypass(&self) -> &BypassList {
+        &self.bypass
+    }
+
+    pub fn evade(&self) -> &BypassList {
+        &self.evade
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bypass.is_empty() && self.evade.is_empty() && self.mode == RuleMode::Bypass
+    }
+
+    pub fn decide(&self, host: &str, ips: &[IpAddr]) -> PolicyDecision {
+        match self.mode {
+            RuleMode::Bypass => {
+                if let Some(found) = self.bypass.check(host, ips) {
+                    PolicyDecision {
+                        evade: false,
+                        reason: Some(format!("bypass ({})", found.reason)),
+                        ips: found.ips,
+                    }
+                } else {
+                    PolicyDecision {
+                        evade: true,
+                        reason: None,
+                        ips: ips.to_vec(),
+                    }
+                }
+            }
+            RuleMode::Evade => {
+                if let Some(found) = self.bypass.check(host, ips) {
+                    // Explicit bypass exclusion overrides allowlist.
+                    return PolicyDecision {
+                        evade: false,
+                        reason: Some(format!("bypass ({})", found.reason)),
+                        ips: found.ips,
+                    };
+                }
+                if let Some(found) = self.evade.check(host, ips) {
+                    PolicyDecision {
+                        evade: true,
+                        reason: Some(format!("evade ({})", found.reason)),
+                        ips: found.ips,
+                    }
+                } else {
+                    PolicyDecision {
+                        evade: false,
+                        reason: Some("not in evade allowlist".to_string()),
+                        ips: ips.to_vec(),
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Destinations that should be proxied without chunking or SNI spoofing.
 #[derive(Default)]
 pub struct BypassList {
@@ -108,6 +212,7 @@ pub struct BypassList {
 }
 
 impl BypassList {
+    #[allow(dead_code)]
     pub fn from_args(args: &Args) -> io::Result<Self> {
         let mut list = Self::default();
         for rule in &args.bypass_ip {
@@ -136,6 +241,36 @@ impl BypassList {
             return Err(invalid(geoip_requirement()));
         }
         Ok(list)
+    }
+
+    pub fn finalize_geoip(&mut self, geoip_db: Option<&Path>) -> io::Result<()> {
+        if let Some(path) = geoip_db {
+            self.load_geoip_db(path)?;
+        }
+        if !self.countries.is_empty() && !self.has_geoip() {
+            return Err(invalid(geoip_requirement()));
+        }
+        Ok(())
+    }
+
+    pub fn domains(&self) -> &HashSet<String> {
+        &self.domains
+    }
+
+    pub fn suffixes(&self) -> &HashSet<String> {
+        &self.suffixes
+    }
+
+    pub fn tlds(&self) -> &HashSet<String> {
+        &self.tlds
+    }
+
+    pub fn nets(&self) -> &[IpNet] {
+        &self.nets
+    }
+
+    pub fn glob_patterns(&self) -> &[String] {
+        &self.glob_patterns
     }
 
     pub fn is_empty(&self) -> bool {
@@ -335,7 +470,7 @@ impl BypassList {
         Ok(())
     }
 
-    fn add_private_nets(&mut self) -> io::Result<()> {
+    pub fn add_private_nets(&mut self) -> io::Result<()> {
         for rule in [
             "10.0.0.0/8",
             "172.16.0.0/12",
@@ -354,7 +489,7 @@ impl BypassList {
 
     /// Loads rules from a file. Each line is `<type> <value>` where type is one of `ip`/`cidr`,
     /// `domain`, `tld`, `geoip`/`country` (case-insensitive). `#` starts a comment.
-    fn load_file(&mut self, path: &Path) -> io::Result<()> {
+    pub fn load_file(&mut self, path: &Path) -> io::Result<()> {
         let contents = std::fs::read_to_string(path).map_err(|e| {
             invalid(format!(
                 "could not read bypass file {}: {e}",
@@ -784,5 +919,31 @@ mod tests {
             Some(BypassReason::GeoIp { country, .. }) if country == "CN"
         ));
         assert!(reason(&bypass, "example.com", &[ip("192.0.2.6")]).is_none());
+    }
+
+    #[test]
+    fn evade_policy_allowlist_evades_only_matching_and_honors_bypass() {
+        let mut bypass = list();
+        bypass.add_domain("exempt.youtube.com").unwrap();
+        let mut evade = list();
+        evade.add_domain(".youtube.com").unwrap();
+        evade.add_ip("198.51.100.0/24").unwrap();
+        let policy = EvadePolicy::new(RuleMode::Evade, bypass, evade);
+
+        let ips = [ip("203.0.113.1")];
+        let yt = policy.decide("www.youtube.com", &ips);
+        assert!(yt.evade);
+        assert_eq!(yt.ips, ips);
+
+        let exempt = policy.decide("exempt.youtube.com", &ips);
+        assert!(!exempt.evade);
+
+        let other = policy.decide("example.org", &ips);
+        assert!(!other.evade);
+
+        let mixed_ips = [ip("203.0.113.1"), ip("198.51.100.5")];
+        let ip_evade = policy.decide("other.org", &mixed_ips);
+        assert!(ip_evade.evade);
+        assert_eq!(ip_evade.ips, vec![ip("198.51.100.5")]);
     }
 }

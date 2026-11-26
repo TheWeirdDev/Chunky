@@ -1,10 +1,15 @@
 mod args;
 mod bypass;
+mod config;
 mod dns;
 mod handler;
 mod http;
+mod pac;
+mod socks4;
+mod socks5;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod spoof;
+mod tls;
 
 /// SNI spoofing needs AF_PACKET sockets, which only Linux and Android have. Elsewhere `--fake-sni`
 /// is accepted but fails at startup.
@@ -14,6 +19,13 @@ mod spoof {
     use std::net::IpAddr;
 
     use tokio::net::TcpStream;
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct SpoofOptions {
+        pub fake_sni: String,
+        pub fake_ttl: Option<u8>,
+        pub fake_bad_checksum: bool,
+    }
 
     fn unsupported() -> io::Error {
         io::Error::new(
@@ -32,7 +44,7 @@ mod spoof {
     pub struct Spoofer;
 
     impl Spoofer {
-        pub fn start(_fake_sni: &str) -> io::Result<Self> {
+        pub fn start(_options: SpoofOptions) -> io::Result<Self> {
             Err(unsupported())
         }
 
@@ -49,21 +61,125 @@ use tokio::io;
 use tokio::net::TcpListener;
 
 use crate::args::Args;
-use crate::bypass::BypassList;
-use crate::dns::{CachedResolver, DNSServerKind, IpPreference};
-use crate::spoof::Spoofer;
+use crate::bypass::RuleMode;
+use crate::config::ResolvedConfig;
+use crate::dns::CachedResolver;
+use crate::handler::RuntimeState;
+use crate::spoof::{SpoofOptions, Spoofer};
+
+#[derive(Clone, PartialEq, Eq)]
+struct ActiveSpoof {
+    fake_sni: String,
+    fake_ttl: Option<u8>,
+    fake_bad_checksum: bool,
+}
+
+async fn build_runtime_state(
+    cfg: ResolvedConfig,
+    prev_spoof: Option<&(ActiveSpoof, Arc<Spoofer>)>,
+) -> io::Result<(Arc<RuntimeState>, Option<(ActiveSpoof, Arc<Spoofer>)>)> {
+    let resolver = Arc::new(
+        CachedResolver::new_with_options(
+            &cfg.dns.server,
+            cfg.dns.kind,
+            cfg.dns.prefer,
+            &cfg.dns.bootstrap,
+            cfg.dns.cache_ttl,
+            cfg.dns.cache_capacity,
+        )
+        .await?,
+    );
+    log::info!(
+        "DNS resolver configured: {} (bootstrap={:?}, cache_ttl={:?}, capacity={})",
+        cfg.dns.server,
+        cfg.dns.bootstrap,
+        cfg.dns.cache_ttl,
+        cfg.dns.cache_capacity
+    );
+
+    let next_spoof = match &cfg.tls.fake_sni {
+        Some(sni) => {
+            let wanted = ActiveSpoof {
+                fake_sni: sni.clone(),
+                fake_ttl: cfg.tls.fake_ttl,
+                fake_bad_checksum: cfg.tls.fake_bad_checksum,
+            };
+            if let Some((prev_key, prev_spoofer)) = prev_spoof {
+                if prev_key == &wanted {
+                    Some((wanted, prev_spoofer.clone()))
+                } else {
+                    let spoofer = start_spoofer(&wanted)?;
+                    Some((wanted, Arc::new(spoofer)))
+                }
+            } else {
+                let spoofer = start_spoofer(&wanted)?;
+                Some((wanted, Arc::new(spoofer)))
+            }
+        }
+        None => {
+            log::info!(
+                "TLS splitting: chunk_size={}, split_sni={}",
+                cfg.tls.chunk_size,
+                cfg.tls.split_sni
+            );
+            None
+        }
+    };
+
+    if !cfg.policy.is_empty() {
+        match cfg.policy.mode() {
+            RuleMode::Bypass => {
+                log::info!("Rule mode: bypass (matched destinations skip DPI evasion)");
+            }
+            RuleMode::Evade => {
+                log::info!("Rule mode: evade allowlist (only matched destinations use DPI evasion)");
+            }
+        }
+    }
+    if !cfg.auth.is_empty() {
+        log::info!("Proxy authentication enabled ({} credential(s))", cfg.auth.len());
+    }
+    if let Some(pac) = &cfg.pac_path {
+        log::info!("PAC endpoint enabled at {pac}");
+    }
+
+    let spoofer = next_spoof.as_ref().map(|(_, s)| s.clone());
+    let state = Arc::new(RuntimeState {
+        listen_host: cfg.host,
+        listen_port: cfg.port,
+        resolver,
+        tls: cfg.tls,
+        spoofer,
+        policy: cfg.policy,
+        auth: cfg.auth,
+        pac_path: cfg.pac_path,
+        pac_proxy: cfg.pac_proxy,
+    });
+    Ok((state, next_spoof))
+}
+
+fn start_spoofer(opts: &ActiveSpoof) -> io::Result<Spoofer> {
+    let spoofer = Spoofer::start(SpoofOptions {
+        fake_sni: opts.fake_sni.clone(),
+        fake_ttl: opts.fake_ttl,
+        fake_bad_checksum: opts.fake_bad_checksum,
+    })
+    .map_err(|e| io::Error::new(e.kind(), format!("SNI spoofing could not start: {e}")))?;
+    log::info!(
+        "SNI spoofing enabled (fake_sni={}, fake_ttl={:?}, fake_bad_checksum={})",
+        opts.fake_sni,
+        opts.fake_ttl,
+        opts.fake_bad_checksum
+    );
+    Ok(spoofer)
+}
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
     let args = Args::parse();
+    let cfg = ResolvedConfig::load(&args)?;
 
-    let prefer = match (args.prefer_ipv6, args.prefer_ipv4) {
-        (true, _) => IpPreference::Ipv6,
-        (_, true) => IpPreference::Ipv4,
-        _ => IpPreference::Any,
-    };
-
-    if args.fake_sni.is_some() && !spoof::has_cap_net_raw() {
+    if cfg.tls.fake_sni.is_some() && !spoof::has_cap_net_raw() {
         let binary = std::env::current_exe()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|_| "<chunky>".to_string());
@@ -77,64 +193,61 @@ async fn main() -> io::Result<()> {
 
     let env = env_logger::Env::default().filter_or(
         "CHUNKY_LOG_LEVEL",
-        if args.verbose { "debug" } else { "info" },
+        if cfg.verbose { "debug" } else { "info" },
     );
     env_logger::init_from_env(env);
 
-    let bypass = Arc::new(BypassList::from_args(&args)?);
-    if !bypass.is_empty() {
-        log::info!("Bypass list active: matching destinations skip chunking and SNI spoofing");
-    }
+    let listener = TcpListener::bind((cfg.host.as_str(), cfg.port)).await?;
+    log::info!("Listening on {}:{} (HTTP/HTTPS + SOCKS4/5)", cfg.host, cfg.port);
 
-    let Args {
-        host,
-        port,
-        chunk_size,
-        dot_server,
-        dns_tcp_server,
-        dns_udp_server,
-        dns_https_server,
-        fake_sni,
-        ..
-    } = args;
+    let (mut state, mut active_spoof) = build_runtime_state(cfg, None).await?;
 
-    let listener = TcpListener::bind((host.as_str(), port)).await?;
-    log::info!("Listening on {host}:{port}");
-
-    let (dns_server, dns_server_kind) = match (dns_tcp_server, dns_udp_server, dns_https_server) {
-        (Some(server), _, _) => (server, DNSServerKind::Tcp),
-        (None, Some(server), _) => (server, DNSServerKind::Udp),
-        (None, None, Some(server)) => (server, DNSServerKind::Https),
-        _ => (dot_server, DNSServerKind::Tls),
-    };
-
-    let resolver = Arc::new(CachedResolver::new(&dns_server, dns_server_kind, prefer).await?);
-    log::info!("DNS resolver configured. using: {dns_server}");
-    let spoofer = match fake_sni {
-        Some(sni) => {
-            let spoofer = Spoofer::start(&sni).map_err(|e| {
-                io::Error::new(e.kind(), format!("SNI spoofing could not start: {e}"))
-            })?;
-            log::info!("Chunking is disabled while SNI spoofing is on");
-            Some(Arc::new(spoofer))
-        }
-        None => {
-            log::info!("Chunk size is: {chunk_size}");
-            None
-        }
-    };
+    #[cfg(unix)]
+    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
 
     loop {
-        let (client, _) = listener.accept().await?;
-        let resolver = resolver.clone();
-        let spoofer = spoofer.clone();
-        let bypass = bypass.clone();
-        tokio::spawn(async move {
-            if let Err(e) =
-                handler::proxy(client, &resolver, chunk_size, spoofer.as_deref(), &bypass).await
-            {
-                log::error!("Error: {e}");
+        #[cfg(unix)]
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (client, _) = accepted?;
+                let conn_state = state.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handler::handle_connection(client, conn_state).await {
+                        log::error!("Error: {e}");
+                    }
+                });
             }
-        });
+            Some(()) = sighup.recv() => {
+                log::info!("Received SIGHUP, reloading configuration and rules...");
+                match ResolvedConfig::load(&args) {
+                    Ok(new_cfg) => {
+                        match build_runtime_state(new_cfg, active_spoof.as_ref()).await {
+                            Ok((new_state, new_spoof)) => {
+                                state = new_state;
+                                active_spoof = new_spoof;
+                                log::info!("Reloaded configuration successfully");
+                            }
+                            Err(e) => {
+                                log::error!("Failed to apply reloaded configuration, keeping existing state: {e}");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("Failed to load configuration on SIGHUP, keeping existing state: {e}");
+                    }
+                }
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            let (client, _) = listener.accept().await?;
+            let conn_state = state.clone();
+            tokio::spawn(async move {
+                if let Err(e) = handler::handle_connection(client, conn_state).await {
+                    log::error!("Error: {e}");
+                }
+            });
+        }
     }
 }

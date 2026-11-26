@@ -1,4 +1,13 @@
-# Unreleased
+# 0.2.0
+- Add unified HTTP(S) + SOCKS4/4a + SOCKS5 auto-detection on a single listening port
+- Support all HTTP methods (`POST`, `PUT`, `DELETE`, `HEAD`, `OPTIONS`, `PATCH`, etc.) and strip proxy-only headers
+- Add HTTP Basic and SOCKS5 username/password authentication (`--auth`)
+- Add PAC (`FindProxyForURL`) HTTP endpoint (`/proxy.pac`, `--pac-path`, `--no-pac`, `--pac-proxy`)
+- Add TOML configuration (`--config`) and `SIGHUP` hot-reload
+- Add SNI (`0x0000`) and ECH (`0xfe0d`) boundary TLS ClientHello splitting with `TCP_NODELAY` (`--split-sni`)
+- Add `--fake-ttl`, `--fake-bad-checksum`, IPv6 support, and dynamic multi-interface routing to SNI spoofing
+- Add DNS cache TTL + bounded LRU eviction (`--dns-cache-ttl`, `--dns-cache-capacity`), DoH/DoT `--dns-bootstrap` IPs, concurrent DoH `A`/`AAAA` queries, multi-server TCP/UDP fallback, and RFC 8305 Happy Eyeballs connection racing
+- Add allowlist (`evade`) rule mode (`--rule-mode evade`, `--evade-ip`, `--evade-domain`, `--evade-tld`, `--evade-geoip`, `--evade-file`)
 - Add bypass lists: matched destinations are still proxied but skip chunking and SNI spoofing
 - Match bypass rules by IP/CIDR, exact or wildcard domain, top-level domain, and GeoIP country
 - Load rules from the command line or a `--bypass-file`, with optional `--bypass-private` ranges
