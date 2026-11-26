@@ -49,6 +49,19 @@ jobs:
           echo "PERL=$((where.exe perl)[0])" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           echo "OPENSSL_SRC_PERL=$((where.exe perl)[0])" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - uses: actions/checkout@v4
+      - name: Wait for release to be available
+        shell: bash
+        run: |
+          for _ in {1..60}; do
+            if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::Release '${GITHUB_REF_NAME}' is not available."
+          exit 1
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
           bin: chunky
