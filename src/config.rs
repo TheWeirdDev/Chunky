@@ -8,6 +8,9 @@ use serde::Deserialize;
 use crate::args::{Args, RuleModeArg};
 use crate::bypass::{BypassList, EvadePolicy, RuleMode};
 use crate::dns::{DNSServerKind, IpPreference};
+use crate::limits::{
+    ConnectionLimits, DEFAULT_HANDSHAKE_TIMEOUT_SECS, DEFAULT_IDLE_TIMEOUT_SECS,
+};
 
 pub const DEFAULT_HOST: &str = "127.0.0.1";
 pub const DEFAULT_PORT: u16 = 8000;
@@ -51,6 +54,7 @@ pub struct TomlConfig {
     pub no_pac: Option<bool>,
     pub pac_proxy: Option<String>,
     pub tls: TomlTlsConfig,
+    pub limits: TomlLimitsConfig,
     pub dns: TomlDnsConfig,
     pub rules: TomlRulesConfig,
 }
@@ -63,6 +67,14 @@ pub struct TomlTlsConfig {
     pub fake_sni: Option<String>,
     pub fake_ttl: Option<u8>,
     pub fake_bad_checksum: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TomlLimitsConfig {
+    pub max_connections: Option<usize>,
+    pub idle_timeout: Option<u64>,
+    pub handshake_timeout: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -134,6 +146,7 @@ pub struct ResolvedConfig {
     pub port: u16,
     pub verbose: bool,
     pub tls: TlsSettings,
+    pub limits: ConnectionLimits,
     pub dns: DnsSettings,
     pub policy: EvadePolicy,
     pub auth: Vec<Credential>,
@@ -175,6 +188,20 @@ impl ResolvedConfig {
         let fake_bad_checksum =
             args.fake_bad_checksum || toml.tls.fake_bad_checksum.unwrap_or(false);
         let split_sni = args.split_sni || toml.tls.split_sni.unwrap_or(false);
+
+        let limits = ConnectionLimits {
+            max_connections: args.max_connections.or(toml.limits.max_connections),
+            idle_timeout: Duration::from_secs(
+                args.idle_timeout
+                    .or(toml.limits.idle_timeout)
+                    .unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS),
+            ),
+            handshake_timeout: Duration::from_secs(
+                args.handshake_timeout
+                    .or(toml.limits.handshake_timeout)
+                    .unwrap_or(DEFAULT_HANDSHAKE_TIMEOUT_SECS),
+            ),
+        };
 
         let (dns_server, dns_kind) = resolve_dns_server(args, &toml.dns)?;
         let prefer = resolve_ip_preference(args, toml.dns.prefer.as_deref())?;
@@ -248,6 +275,7 @@ impl ResolvedConfig {
                 fake_ttl,
                 fake_bad_checksum,
             },
+            limits,
             dns: DnsSettings {
                 server: dns_server,
                 kind: dns_kind,
@@ -431,6 +459,33 @@ mod tests {
 
     fn parse_args(extra: &[&str]) -> Args {
         Args::parse_from(std::iter::once("chunky").chain(extra.iter().copied()))
+    }
+
+    #[test]
+    fn limits_have_defaults() {
+        let resolved = ResolvedConfig::merge(&parse_args(&[]), TomlConfig::default()).unwrap();
+        assert_eq!(resolved.limits, ConnectionLimits::default());
+        assert_eq!(resolved.limits.max_connections, None);
+        assert_eq!(resolved.limits.idle_timeout, Duration::from_secs(300));
+        assert_eq!(resolved.limits.handshake_timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn limits_come_from_toml_and_cli_overrides() {
+        let toml: TomlConfig = toml::from_str(
+            "[limits]\nmax_connections = 100\nidle_timeout = 60\nhandshake_timeout = 5\n",
+        )
+        .unwrap();
+        let resolved = ResolvedConfig::merge(&parse_args(&[]), toml.clone()).unwrap();
+        assert_eq!(resolved.limits.max_connections, Some(100));
+        assert_eq!(resolved.limits.idle_timeout, Duration::from_secs(60));
+        assert_eq!(resolved.limits.handshake_timeout, Duration::from_secs(5));
+
+        let args = parse_args(&["--max-connections", "0", "--idle-timeout", "0", "--handshake-timeout", "9"]);
+        let resolved = ResolvedConfig::merge(&args, toml).unwrap();
+        assert_eq!(resolved.limits.max_connections, Some(0));
+        assert_eq!(resolved.limits.idle_timeout, Duration::ZERO);
+        assert_eq!(resolved.limits.handshake_timeout, Duration::from_secs(9));
     }
 
     #[test]

@@ -1,3 +1,9 @@
+# 0.2.1
+- Fix `Too many open files` crash: transient `accept()` errors (`EMFILE`, `ENFILE`, ...) are retried with backoff instead of stopping the proxy
+- Close both sockets as soon as either tunnel direction fails; close idle tunnels (`--idle-timeout`) and stalled handshakes (`--handshake-timeout`)
+- Cap concurrent connections (`--max-connections`, derived from the open file limit by default) and raise the soft `RLIMIT_NOFILE` to the hard limit at startup
+- Fix a pending SNI-spoof entry leak when a connection attempt is cancelled
+
 # 0.2.0
 - Add unified HTTP(S) + SOCKS4/4a + SOCKS5 auto-detection on a single listening port
 - Support all HTTP methods (`POST`, `PUT`, `DELETE`, `HEAD`, `OPTIONS`, `PATCH`, etc.) and strip proxy-only headers

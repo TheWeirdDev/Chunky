@@ -5,8 +5,7 @@ use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
 
-use tokio::io::{self, AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::io::{self, AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
@@ -14,6 +13,7 @@ use crate::bypass::{BypassList, EvadePolicy};
 use crate::config::{Credential, TlsSettings};
 use crate::dns::CachedResolver;
 use crate::http;
+use crate::limits::{with_timeout, Activity, ConnectionLimits, IdleGuard};
 use crate::pac;
 use crate::socks4;
 use crate::socks5;
@@ -31,6 +31,7 @@ pub struct RuntimeState {
     pub listen_port: u16,
     pub resolver: Arc<CachedResolver>,
     pub tls: TlsSettings,
+    pub limits: ConnectionLimits,
     pub spoofer: Option<Arc<Spoofer>>,
     pub policy: EvadePolicy,
     pub auth: Vec<Credential>,
@@ -42,7 +43,13 @@ pub struct RuntimeState {
 /// Auto-detects SOCKS4 (`0x04`), SOCKS5 (`0x05`), vs HTTP/HTTPS proxy requests.
 pub async fn handle_connection(stream: TcpStream, state: Arc<RuntimeState>) -> io::Result<()> {
     let mut first = [0u8; 1];
-    if stream.peek(&mut first).await? == 0 {
+    let peeked = with_timeout(
+        state.limits.handshake_timeout,
+        "waiting for the first byte",
+        stream.peek(&mut first),
+    )
+    .await?;
+    if peeked == 0 {
         return Ok(());
     }
     match first[0] {
@@ -54,7 +61,12 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<RuntimeState>) -> i
 
 async fn handle_socks4(mut stream: TcpStream, state: &RuntimeState) -> io::Result<()> {
     let peer = stream.peer_addr()?;
-    let target = socks4::handshake(&mut stream, &state.auth).await?;
+    let target = with_timeout(
+        state.limits.handshake_timeout,
+        "SOCKS4 handshake",
+        socks4::handshake(&mut stream, &state.auth),
+    )
+    .await?;
     log::debug!(
         "new SOCKS4 connection from {peer:?} to {}:{}",
         target.host,
@@ -74,7 +86,12 @@ async fn handle_socks4(mut stream: TcpStream, state: &RuntimeState) -> io::Resul
 
 async fn handle_socks5(mut stream: TcpStream, state: &RuntimeState) -> io::Result<()> {
     let peer = stream.peer_addr()?;
-    let target = socks5::handshake(&mut stream, &state.auth).await?;
+    let target = with_timeout(
+        state.limits.handshake_timeout,
+        "SOCKS5 handshake",
+        socks5::handshake(&mut stream, &state.auth),
+    )
+    .await?;
     log::debug!(
         "new SOCKS5 connection from {peer:?} to {}:{}",
         target.host,
@@ -146,6 +163,7 @@ async fn tunnel_socks(
         should_split,
         state.tls.chunk_size,
         state.tls.split_sni,
+        state.limits.idle_timeout,
     )
     .await
 }
@@ -154,7 +172,12 @@ async fn handle_http(stream: TcpStream, state: &RuntimeState) -> io::Result<()> 
     let addr = stream.peer_addr()?;
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
-    let (req_line, headers) = read_request_head(&mut reader).await?;
+    let (req_line, headers) = with_timeout(
+        state.limits.handshake_timeout,
+        "reading the HTTP request head",
+        read_request_head(&mut reader),
+    )
+    .await?;
     let req = http::parse_http_request_with_headers(&req_line, &headers)?;
 
     // Serve PAC endpoint on origin-form GET/HEAD requests matching `pac_path`.
@@ -255,6 +278,7 @@ async fn handle_http(stream: TcpStream, state: &RuntimeState) -> io::Result<()> 
         should_split,
         state.tls.chunk_size,
         state.tls.split_sni,
+        state.limits.idle_timeout,
     )
     .await
 }
@@ -310,38 +334,60 @@ pub async fn proxy(
         req.is_https && spoofer.is_none() && bypassed.is_none(),
         chunk_size,
         false,
+        ConnectionLimits::default().idle_timeout,
     )
     .await
 }
 
-async fn tunnel(
-    client_reader: BufReader<OwnedReadHalf>,
-    client_writer: OwnedWriteHalf,
-    upstream_reader: BufReader<OwnedReadHalf>,
-    upstream_writer: OwnedWriteHalf,
+/// Pumps both directions of a tunnel until each side hits EOF.
+///
+/// Both directions run inside the calling task, so the first error (or the caller being dropped
+/// or aborted) drops the sibling direction too and every socket closes immediately instead of
+/// lingering until the other side happens to finish. A clean EOF on one direction only
+/// half-closes, so the opposite direction can still drain. The tunnel is closed after
+/// `idle_timeout` without traffic in either direction (zero disables).
+async fn tunnel<CR, CW, UR, UW>(
+    client_reader: CR,
+    client_writer: CW,
+    upstream_reader: UR,
+    upstream_writer: UW,
     needs_tls_split: bool,
     chunk_size: usize,
     split_sni: bool,
-) -> io::Result<()> {
-    let client_to_server = tokio::spawn(forward(
-        client_reader,
-        upstream_writer,
-        needs_tls_split,
-        "client",
-        chunk_size,
-        split_sni,
-    ));
-    let server_to_client = tokio::spawn(forward(
-        upstream_reader,
-        client_writer,
-        false,
-        "server",
-        chunk_size,
-        false,
-    ));
-    let (r1, r2) = tokio::join!(client_to_server, server_to_client);
-    r1??;
-    r2??;
+    idle_timeout: Duration,
+) -> io::Result<()>
+where
+    CR: AsyncRead + Unpin,
+    CW: AsyncWrite + Unpin,
+    UR: AsyncRead + Unpin,
+    UW: AsyncWrite + Unpin,
+{
+    let activity = Activity::new();
+    let idle = IdleGuard {
+        idle: idle_timeout,
+        activity: &activity,
+    };
+    activity.touch();
+    tokio::try_join!(
+        forward(
+            client_reader,
+            upstream_writer,
+            needs_tls_split,
+            "client",
+            chunk_size,
+            split_sni,
+            &idle,
+        ),
+        forward(
+            upstream_reader,
+            client_writer,
+            false,
+            "server",
+            chunk_size,
+            false,
+            &idle,
+        ),
+    )?;
     Ok(())
 }
 
@@ -506,18 +552,23 @@ async fn read_request_head<R: AsyncBufRead + Unpin>(
 /// record (`0x16 0x03 <4`), splits the record (at SNI/ECH boundaries when `split_sni` is set,
 /// and/or into `chunk_size` records) and sends each record separately. Non-TLS traffic (such as
 /// SSH or plain protocols over SOCKS5) is forwarded immediately without blocking for extra bytes.
-async fn forward(
-    mut reader: BufReader<OwnedReadHalf>,
-    mut writer: OwnedWriteHalf,
+async fn forward<R, W>(
+    mut reader: R,
+    mut writer: W,
     needs_tls_split: bool,
     name: &str,
     chunk_size: usize,
     split_sni: bool,
-) -> io::Result<()> {
+    idle: &IdleGuard<'_>,
+) -> io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     let mut buf = [0u8; 4096];
 
     if needs_tls_split {
-        let n = reader.read(&mut buf).await?;
+        let n = idle.read(&mut reader, &mut buf).await?;
         if n == 0 {
             writer.shutdown().await?;
             log::debug!("Connection closed by {name}");
@@ -526,9 +577,9 @@ async fn forward(
         if buf[0] == 0x16 {
             let mut initial = buf[..n].to_vec();
             while initial.len() < 5 {
-                let m = reader.read(&mut buf).await?;
+                let m = idle.read(&mut reader, &mut buf).await?;
                 if m == 0 {
-                    writer.write_all(&initial).await?;
+                    idle.write_all(&mut writer, &initial).await?;
                     writer.shutdown().await?;
                     return Ok(());
                 }
@@ -539,9 +590,9 @@ async fn forward(
                 let record_len = u16::from_be_bytes([initial[3], initial[4]]) as usize;
                 let total_len = 5 + record_len;
                 while initial.len() < total_len {
-                    let m = reader.read(&mut buf).await?;
+                    let m = idle.read(&mut reader, &mut buf).await?;
                     if m == 0 {
-                        writer.write_all(&initial).await?;
+                        idle.write_all(&mut writer, &initial).await?;
                         writer.shutdown().await?;
                         return Ok(());
                     }
@@ -555,34 +606,35 @@ async fn forward(
                     records.len()
                 );
                 for record in records {
-                    writer.write_all(&record).await?;
+                    idle.write_all(&mut writer, &record).await?;
                     writer.flush().await?;
                 }
                 if initial.len() > total_len {
-                    writer.write_all(&initial[total_len..]).await?;
+                    idle.write_all(&mut writer, &initial[total_len..]).await?;
                 }
             } else {
-                writer.write_all(&initial).await?;
+                idle.write_all(&mut writer, &initial).await?;
             }
         } else {
-            writer.write_all(&buf[..n]).await?;
+            idle.write_all(&mut writer, &buf[..n]).await?;
         }
     }
 
     loop {
-        let n = reader.read(&mut buf).await?;
+        let n = idle.read(&mut reader, &mut buf).await?;
         if n == 0 {
             writer.shutdown().await?;
             log::debug!("Connection closed by {name}");
             return Ok(());
         }
-        writer.write_all(&buf[..n]).await?;
+        idle.write_all(&mut writer, &buf[..n]).await?;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
     use base64::engine::general_purpose::STANDARD as BASE64;
     use base64::Engine as _;
     use crate::bypass::BypassList;
@@ -607,6 +659,7 @@ mod tests {
                 fake_ttl: None,
                 fake_bad_checksum: false,
             },
+            limits: ConnectionLimits::default(),
             spoofer: None,
             policy,
             auth,
@@ -1138,5 +1191,127 @@ mod tests {
         assert_eq!(&rep2[..2], &[0x00, socks4::REP_REJECTED]);
 
         srv.await.unwrap();
+    }
+
+    /// A writer whose every write fails, to simulate an upstream that reset the connection.
+    struct BrokenWriter;
+
+    impl AsyncWrite for BrokenWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn tunnel_closes_an_idle_connection() {
+        let (client_side, proxy_client) = tokio::io::duplex(1024);
+        let (proxy_upstream, _upstream_side) = tokio::io::duplex(1024);
+        let (cr, cw) = tokio::io::split(proxy_client);
+        let (ur, uw) = tokio::io::split(proxy_upstream);
+
+        let started = std::time::Instant::now();
+        let res = timeout(
+            Duration::from_secs(5),
+            tunnel(cr, cw, ur, uw, false, 4, false, Duration::from_millis(100)),
+        )
+        .await
+        .expect("idle tunnel must not hang");
+        let err = res.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(client_side);
+    }
+
+    #[tokio::test]
+    async fn tunnel_stays_open_while_traffic_flows() {
+        let (mut client_side, proxy_client) = tokio::io::duplex(1024);
+        let (proxy_upstream, mut upstream_side) = tokio::io::duplex(1024);
+        let (cr, cw) = tokio::io::split(proxy_client);
+        let (ur, uw) = tokio::io::split(proxy_upstream);
+        let task = tokio::spawn(tunnel(cr, cw, ur, uw, false, 4, false, Duration::from_millis(200)));
+
+        // Only the upstream talks for ~500ms (> idle); the silent client side must not time out.
+        for _ in 0..5 {
+            sleep(Duration::from_millis(100)).await;
+            upstream_side.write_all(b"x").await.unwrap();
+            let mut byte = [0u8; 1];
+            client_side.read_exact(&mut byte).await.unwrap();
+        }
+        assert!(!task.is_finished());
+
+        client_side.shutdown().await.unwrap();
+        upstream_side.shutdown().await.unwrap();
+        timeout(Duration::from_secs(5), task).await.unwrap().unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn tunnel_error_in_one_direction_closes_the_other() {
+        let (mut client_side, proxy_client) = tokio::io::duplex(1024);
+        let (proxy_upstream, upstream_side) = tokio::io::duplex(1024);
+        let (cr, cw) = tokio::io::split(proxy_client);
+        let (ur, _uw) = tokio::io::split(proxy_upstream);
+
+        // Idle timeout disabled: only the error can end the tunnel.
+        let task = tokio::spawn(tunnel(cr, cw, ur, BrokenWriter, false, 4, false, Duration::ZERO));
+        client_side.write_all(b"hello").await.unwrap();
+
+        let err = timeout(Duration::from_secs(5), task)
+            .await
+            .expect("tunnel must end after a write error")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+
+        // The client side was torn down too: the peer sees EOF instead of a dangling socket.
+        let mut buf = [0u8; 8];
+        let n = timeout(Duration::from_secs(5), client_side.read(&mut buf))
+            .await
+            .expect("client side left open")
+            .unwrap();
+        assert_eq!(n, 0);
+        drop(upstream_side);
+    }
+
+    #[tokio::test]
+    async fn silent_client_hits_the_handshake_timeout() {
+        use tokio::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let resolver = Arc::new(
+            CachedResolver::new("127.0.0.1", DNSServerKind::Tcp, IpPreference::Any)
+                .await
+                .unwrap(),
+        );
+        let mut state = Arc::try_unwrap(test_state(
+            resolver,
+            EvadePolicy::default(),
+            Vec::new(),
+            None,
+            4,
+            false,
+        ))
+        .ok()
+        .unwrap();
+        state.limits.handshake_timeout = Duration::from_millis(100);
+        let state = Arc::new(state);
+
+        let _silent = TcpStream::connect(addr).await.unwrap();
+        let (server_side, _) = listener.accept().await.unwrap();
+        let err = timeout(Duration::from_secs(5), handle_connection(server_side, state))
+            .await
+            .expect("handshake timeout did not fire")
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
     }
 }

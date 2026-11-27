@@ -151,6 +151,18 @@ pub struct Args {
     #[arg(long, value_name = "HOST:PORT")]
     pub pac_proxy: Option<String>,
 
+    /// Max concurrent client connections (0 = unlimited). [default: derived from the open file limit]
+    #[arg(long, value_name = "COUNT")]
+    pub max_connections: Option<usize>,
+
+    /// Close a tunnel after this many seconds without traffic in either direction (0 disables). [default: 300]
+    #[arg(long, value_name = "SECONDS")]
+    pub idle_timeout: Option<u64>,
+
+    /// Seconds a client has to finish its SOCKS/HTTP handshake (0 disables). [default: 30]
+    #[arg(long, value_name = "SECONDS")]
+    pub handshake_timeout: Option<u64>,
+
     #[arg(short = 'v', long)]
     pub verbose: bool,
 }

@@ -1,6 +1,6 @@
 [package]
 name = "chunky"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 
 [features]
@@ -34,5 +34,7 @@ openssl = { version = "0.10.68", features = ["vendored"] }
 # SNI spoofing needs AF_PACKET, which only Linux and Android have.
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 pnet_packet = "0.33"
-libc = "0.2"
 rand = "0.8"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

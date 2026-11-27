@@ -43,6 +43,9 @@ The following CLI options are available (all can also be configured via a TOML f
 - `--auth`: Require HTTP Basic (`Proxy-Authorization`) and SOCKS5 username/password authentication (`USER:PASS`). Repeatable.
 - `--pac-path`: HTTP path to serve the PAC (`FindProxyForURL`) script on. Default: **/proxy.pac**
 - `--no-pac`: Disable the PAC HTTP endpoint.
+- `--max-connections`: Max concurrent client connections (`0` = unlimited). Further clients wait in the listen backlog. Default: **derived from the open file limit** (the soft limit is raised to the hard limit at startup).
+- `--idle-timeout`: Close a tunnel after this many seconds without traffic in either direction (`0` disables). Default: **300**
+- `--handshake-timeout`: Seconds a client has to finish its SOCKS/HTTP handshake (`0` disables). Default: **30**
 - `--pac-proxy`: Override the `PROXY host:port` address returned by the PAC script.
 - `-v` or `--verbose`: Enable verbose logging. Default: **Disabled**
 - `-h` or `--help`: Display the help message
@@ -73,6 +76,11 @@ split_sni = true
 # fake_sni = "www.speedtest.net"
 # fake_ttl = 3
 # fake_bad_checksum = false
+
+[limits]
+# max_connections = 1000
+idle_timeout = 300
+handshake_timeout = 30
 
 [dns]
 mode = "https"

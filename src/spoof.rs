@@ -531,6 +531,21 @@ struct PendingConn {
     done: Option<oneshot::Sender<Result<(), &'static str>>>,
 }
 
+/// Drops its `pending` entry on drop (a no-op when the sniffer already removed it).
+struct PendingGuard {
+    pending: Pending,
+    key: ConnKey,
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.key);
+    }
+}
+
 #[derive(Clone, Debug)]
 struct InterfaceInfo {
     name: String,
@@ -643,6 +658,13 @@ impl Spoofer {
             },
         );
 
+        // Removes the pending entry however this future ends: success, error, timeout, or being
+        // dropped mid-race (Happy Eyeballs losers), which would otherwise leak the entry.
+        let _pending_guard = PendingGuard {
+            pending: self.pending.clone(),
+            key,
+        };
+
         let result = async move {
             let stream = socket.connect(SocketAddr::new(remote, port)).await?;
             match timeout(FAKE_SEND_TIMEOUT, done_rx).await {
@@ -657,9 +679,6 @@ impl Spoofer {
             }
         }
         .await;
-        if result.is_err() {
-            self.lock_pending().remove(&key);
-        }
         result
     }
 
@@ -1060,6 +1079,48 @@ mod tests {
             fake_ttl,
             fake_bad_checksum,
         )
+    }
+
+    fn pending_with_one_entry() -> (Pending, ConnKey) {
+        let key = ConnKey {
+            local_ip: IpAddr::V4(LOCAL_V4),
+            local_port: LPORT,
+            remote_ip: IpAddr::V4(REMOTE_V4),
+            remote_port: RPORT,
+        };
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        pending.lock().unwrap().insert(
+            key,
+            PendingConn {
+                handshake: new_handshake_v4(None, false),
+                done: None,
+            },
+        );
+        (pending, key)
+    }
+
+    #[test]
+    fn pending_guard_removes_the_entry_when_dropped() {
+        let (pending, key) = pending_with_one_entry();
+        let guard = PendingGuard {
+            pending: pending.clone(),
+            key,
+        };
+        assert_eq!(pending.lock().unwrap().len(), 1);
+        drop(guard);
+        assert!(pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn pending_guard_tolerates_an_already_removed_entry() {
+        let (pending, key) = pending_with_one_entry();
+        let guard = PendingGuard {
+            pending: pending.clone(),
+            key,
+        };
+        pending.lock().unwrap().remove(&key);
+        drop(guard);
+        assert!(pending.lock().unwrap().is_empty());
     }
 
     fn run_to_injection_v4(hs: &mut Handshake, syn_seq: u32, server_isn: u32) -> Vec<u8> {

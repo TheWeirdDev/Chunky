@@ -4,6 +4,7 @@ mod config;
 mod dns;
 mod handler;
 mod http;
+mod limits;
 mod pac;
 mod socks4;
 mod socks5;
@@ -58,7 +59,8 @@ use std::sync::Arc;
 
 use clap::Parser;
 use tokio::io;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::args::Args;
 use crate::bypass::RuleMode;
@@ -149,6 +151,7 @@ async fn build_runtime_state(
         listen_port: cfg.port,
         resolver,
         tls: cfg.tls,
+        limits: cfg.limits,
         spoofer,
         policy: cfg.policy,
         auth: cfg.auth,
@@ -197,6 +200,22 @@ async fn main() -> io::Result<()> {
     );
     env_logger::init_from_env(env);
 
+    let nofile_limit = limits::raise_nofile_limit();
+    let max_connections = cfg.limits.effective_max_connections(nofile_limit);
+    match (max_connections, nofile_limit) {
+        (Some(max), Some(nofile)) => {
+            log::info!("Connection limit: {max} (open file limit {nofile})");
+        }
+        (Some(max), None) => log::info!("Connection limit: {max}"),
+        (None, Some(nofile)) => {
+            log::warn!("Connection limit disabled (open file limit {nofile})");
+        }
+        (None, None) => log::info!("Connection limit disabled"),
+    }
+    let limiter = Arc::new(Semaphore::new(
+        max_connections.map_or(Semaphore::MAX_PERMITS, |n| n.min(Semaphore::MAX_PERMITS)),
+    ));
+
     let listener = TcpListener::bind((cfg.host.as_str(), cfg.port)).await?;
     log::info!("Listening on {}:{} (HTTP/HTTPS + SOCKS4/5)", cfg.host, cfg.port);
 
@@ -208,14 +227,9 @@ async fn main() -> io::Result<()> {
     loop {
         #[cfg(unix)]
         tokio::select! {
-            accepted = listener.accept() => {
-                let (client, _) = accepted?;
-                let conn_state = state.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = handler::handle_connection(client, conn_state).await {
-                        log::error!("Error: {e}");
-                    }
-                });
+            accepted = accept_connection(&listener, &limiter) => {
+                let (client, permit) = accepted?;
+                spawn_connection(client, permit, state.clone());
             }
             Some(()) = sighup.recv() => {
                 log::info!("Received SIGHUP, reloading configuration and rules...");
@@ -241,13 +255,114 @@ async fn main() -> io::Result<()> {
 
         #[cfg(not(unix))]
         {
-            let (client, _) = listener.accept().await?;
-            let conn_state = state.clone();
-            tokio::spawn(async move {
-                if let Err(e) = handler::handle_connection(client, conn_state).await {
-                    log::error!("Error: {e}");
-                }
-            });
+            let (client, permit) = accept_connection(&listener, &limiter).await?;
+            spawn_connection(client, permit, state.clone());
         }
+    }
+}
+
+/// Waits for a free connection slot, then accepts a client. Transient `accept()` failures (such
+/// as `EMFILE`) are retried with backoff rather than ending the proxy. Cancel-safe.
+async fn accept_connection(
+    listener: &TcpListener,
+    limiter: &Arc<Semaphore>,
+) -> io::Result<(TcpStream, OwnedSemaphorePermit)> {
+    if limiter.available_permits() == 0 {
+        log::debug!("Connection limit reached; waiting for a slot");
+    }
+    let permit = limiter
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|e| io::Error::other(format!("connection limiter closed: {e}")))?;
+    let (client, _) = limits::accept_with_retry(
+        || listener.accept(),
+        limits::ACCEPT_BACKOFF_INITIAL,
+        limits::ACCEPT_BACKOFF_MAX,
+    )
+    .await?;
+    Ok((client, permit))
+}
+
+/// Serves one client; the connection slot is released when the task ends.
+fn spawn_connection(client: TcpStream, permit: OwnedSemaphorePermit, state: Arc<RuntimeState>) {
+    tokio::spawn(async move {
+        let _permit = permit;
+        if let Err(e) = handler::handle_connection(client, state).await {
+            log::error!("Error: {e}");
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn connection_limit_applies_backpressure_until_a_slot_frees() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let limiter = Arc::new(Semaphore::new(1));
+
+        let _c1 = TcpStream::connect(addr).await.unwrap();
+        let (_s1, permit1) = accept_connection(&listener, &limiter).await.unwrap();
+        assert_eq!(limiter.available_permits(), 0);
+
+        let _c2 = TcpStream::connect(addr).await.unwrap();
+        let blocked =
+            tokio::time::timeout(Duration::from_millis(100), accept_connection(&listener, &limiter))
+                .await;
+        assert!(blocked.is_err(), "second accept must wait for a free slot");
+
+        drop(permit1);
+        let (_s2, _permit2) =
+            tokio::time::timeout(Duration::from_secs(5), accept_connection(&listener, &limiter))
+                .await
+                .expect("accept should proceed once a slot is free")
+                .unwrap();
+    }
+
+    #[tokio::test]
+    async fn spawned_connection_releases_its_slot_when_done() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let limiter = Arc::new(Semaphore::new(1));
+        let resolver = Arc::new(
+            CachedResolver::new(
+                "127.0.0.1",
+                crate::dns::DNSServerKind::Tcp,
+                crate::dns::IpPreference::Any,
+            )
+            .await
+            .unwrap(),
+        );
+        let args = <Args as Parser>::parse_from(["chunky"]);
+        let cfg = ResolvedConfig::load(&args).unwrap();
+        let state = Arc::new(RuntimeState {
+            listen_host: cfg.host,
+            listen_port: cfg.port,
+            resolver,
+            tls: cfg.tls,
+            limits: cfg.limits,
+            spoofer: None,
+            policy: cfg.policy,
+            auth: cfg.auth,
+            pac_path: cfg.pac_path,
+            pac_proxy: cfg.pac_proxy,
+        });
+
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (server_side, permit) = accept_connection(&listener, &limiter).await.unwrap();
+        spawn_connection(server_side, permit, state);
+        assert_eq!(limiter.available_permits(), 0);
+
+        // The client hangs up without sending anything: the handler ends and frees the slot.
+        drop(client);
+        let _slot = tokio::time::timeout(Duration::from_secs(5), limiter.acquire())
+            .await
+            .expect("slot was never released")
+            .unwrap();
     }
 }
